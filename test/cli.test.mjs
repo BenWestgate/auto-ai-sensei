@@ -1,0 +1,45 @@
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+
+const script = path.resolve('src/ai-sensei.mjs');
+const source = readFileSync(script, 'utf8');
+
+function run(...args) {
+  return spawnSync(process.execPath, [script, ...args], {
+    cwd: process.cwd(),
+    stdio: ['ignore', 'ignore', 'ignore'],
+  });
+}
+
+test('--help is generic and contains no personal account defaults', () => {
+  const result = run('--help');
+  assert.equal(result.status, 0);
+  assert.match(source, /Auto AI Sensei/);
+  assert.match(source, /--me NAME/);
+  assert.match(source, /--ogs-account NAME/);
+  assert.match(source, /--goquest-account NAME/);
+  assert.match(source, /const DEFAULT_PLAYER_NAMES = Object\.freeze\(\[\]\);/);
+  assert.match(source, /const DEFAULT_OGS_ACCOUNTS = Object\.freeze\(\[\]\);/);
+  assert.match(source, /const DEFAULT_GOQUEST_ACCOUNTS = Object\.freeze\(\[\]\);/);
+});
+
+test('cleanup requires an explicit player alias before authentication', () => {
+  const result = run();
+  assert.equal(result.status, 1);
+  assert.match(source, /cleanup requires at least one --me NAME/);
+});
+
+test('OGS import requires an explicit account', () => {
+  const result = run('--ogs-import');
+  assert.equal(result.status, 1);
+  assert.match(source, /--ogs-import requires at least one --ogs-account NAME/);
+});
+
+test('GoQuest discovery requires an explicit account', () => {
+  const result = run('--goquest-import');
+  assert.equal(result.status, 1);
+  assert.match(source, /--goquest-import requires at least one --goquest-account NAME/);
+});

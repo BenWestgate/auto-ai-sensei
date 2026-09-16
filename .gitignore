@@ -1,0 +1,28 @@
+node_modules/
+
+# Local authenticated browser state. Never commit this.
+.ai-sensei-playwright-profile/
+.ai-sensei-browser/
+
+# Generated cleanup/import plans and checkpoints.
+cleanup-plan.json
+cleanup-plan.csv
+ogs-import-plan.json
+ogs-import-plan.csv
+ogs-import-state.json
+goquest-import-plan.json
+goquest-import-plan.csv
+goquest-profile-probe-raw.json
+goquest-game-payloads-raw.json
+goquest-linkage-plan.json
+goquest-linkage-plan.csv
+memos-backup-*.json
+
+# Diagnostics and captures may contain account/session data.
+*-diagnostic-*.json
+*-diagnostic-*.png
+*.har
+
+# OS/editor noise.
+.DS_Store
+*.swp

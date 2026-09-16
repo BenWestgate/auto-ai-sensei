@@ -1,0 +1,59 @@
+# Architecture and safety invariants
+
+Auto AI Sensei grew from a personal cleanup/import script. This document records the behavior that should remain stable while the implementation is refactored.
+
+## Curation policy
+
+For every eligible game, the planner keeps at most one practice problem from the user's own moves.
+
+1. Rank mistakes by point loss.
+2. De-duplicate candidates by the first move of the AI solution.
+3. Keep the top three distinct candidates.
+4. A candidate qualifies at `>= 1.0` point loss **or** `>= 2` percentage points of win-rate loss.
+5. Among qualifying top-three candidates, prefer larger win-rate loss, then larger point loss, then earlier move number.
+
+If no candidate qualifies, the desired state is zero saved problems for that game.
+
+## Identity handling
+
+AI Sensei generated game titles are interpreted as `White vs Black`. User aliases are never built into the repository; callers provide them with repeated `--me NAME` arguments.
+
+The planner also recognizes AI Sensei's teaching-game human label as the user's side, and recognizes its normal-game human label only when the opponent clearly looks like an AI/bot. Ambiguous identity is skipped rather than guessed.
+
+## Move indexing
+
+This is a critical invariant:
+
+```text
+memo :move-number N = actual target move N
+problem color       = color of move N
+loss for move N     = analysis transition N-1 -> N
+```
+
+Do not introduce a `+1` offset when refactoring this logic.
+
+## Replacement ordering
+
+When the selected canonical problem differs from what is saved, execution creates and verifies the replacement before deleting the old memo. Deletes use Firestore `updateTime` preconditions. A raw memo backup is written before mutation.
+
+## Dry-run gates
+
+Cleanup and OGS import are dry-run first. A plan hash is generated from the current plan and must be supplied back to the mutation command. A stale hash must fail after the plan changes.
+
+Creating new practice problems has an additional `--allow-create` gate. OGS uploading has an additional `--allow-ogs-upload` gate.
+
+## OGS duplicate detection
+
+The OGS importer fingerprints the board record using board dimensions, sorted setup stones, and the full ordered main-line move sequence. Player names, comments, ranks, and results are deliberately excluded from the fingerprint.
+
+Unique fingerprints with at least eight moves are treated as local duplicates. Short games and fingerprint collisions require stricter player/title agreement; otherwise AI Sensei's duplicate dialog remains the fallback authority. The automation never chooses "Reupload game".
+
+Boards with either dimension below 7 are skipped before upload.
+
+## GoQuest status
+
+GoQuest support is intentionally read-only. It probes public profile/game data and writes audit files, but there is no GoQuest-to-AI-Sensei upload flag. Do not add an upload path until historical enumeration and payload semantics are positively validated.
+
+## Sensitive data
+
+Never commit browser profiles, cookies, bearer/refresh tokens, authenticated HAR files, raw authorization headers, or generated backups/audit files containing private account data. The repository `.gitignore` covers the standard outputs, but new diagnostics must be reviewed before commit.
