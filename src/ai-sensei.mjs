@@ -92,6 +92,12 @@ import {
   selectTopDistinctByFirstSolutionMove,
 } from './cleanup/policy.mjs';
 import { importedGameMetadataFromUploadFields } from './games/imported-game.mjs';
+import {
+  classifyPlannedSmallBoards,
+  reconcileOgsImportState,
+  summarizeOgsImportState,
+  verifyOgsImportPlanState,
+} from './ogs/checkpoint.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -176,6 +182,8 @@ function parseArgs(argv) {
     waitAnalysisMinutes: 10,
     ogsUploadTimeoutMs: OGS_UPLOAD_TIMEOUT_MS,
     ogsUploadAttempts: OGS_UPLOAD_ATTEMPTS,
+    ogsReconcileState: null,
+    ogsReconcileOnly: false,
     goquestImport: false,
     goquestAccounts: [...DEFAULT_GOQUEST_ACCOUNTS],
     goquestGtypes: [...DEFAULT_GOQUEST_GTYPES],
@@ -205,6 +213,8 @@ function parseArgs(argv) {
     else if (a === '--wait-analysis-minutes') out.waitAnalysisMinutes = Number(argv[++i]);
     else if (a === '--ogs-upload-timeout-seconds') out.ogsUploadTimeoutMs = Number(argv[++i]) * 1000;
     else if (a === '--ogs-upload-attempts') out.ogsUploadAttempts = Number(argv[++i]);
+    else if (a === '--ogs-reconcile-state') out.ogsReconcileState = path.resolve(argv[++i] ?? '');
+    else if (a === '--ogs-reconcile-only') out.ogsReconcileOnly = true;
     else if (a === '--goquest-import') out.goquestImport = true;
     else if (a === '--goquest-account') out.goquestAccounts.push(argv[++i] ?? '');
     else if (a === '--goquest-gtype') out.goquestGtypes.push(argv[++i] ?? '');
@@ -242,6 +252,10 @@ OGS import stage (runs instead of cleanup planning):
   --ogs-upload-timeout-seconds N
                           Wait for one AI Sensei upload outcome (default 180 seconds).
   --ogs-upload-attempts N  Retry transient upload/UI failures per game (default 3).
+  --ogs-reconcile-state PATH
+                          Restore unresolved checkpoint rows from another checkpoint only
+                          when its AI game IDs still exist in the live upload index.
+  --ogs-reconcile-only    Verify/reconcile the checkpoint and exit without uploading.
 
 GoQuest discovery stage (intentionally read-only):
   --goquest-import         Probe public GoQuest profiles, retrieve known public game payloads,
@@ -326,6 +340,15 @@ Examples:
   }
   if (out.allowOgsUpload && !out.confirmOgs) {
     die('--allow-ogs-upload requires --confirm-ogs HASH from an OGS dry run.');
+  }
+  if (out.ogsReconcileState && !out.ogsImport) {
+    die('--ogs-reconcile-state requires --ogs-import.');
+  }
+  if (out.ogsReconcileOnly && !out.ogsReconcileState) {
+    die('--ogs-reconcile-only requires --ogs-reconcile-state PATH.');
+  }
+  if (out.ogsReconcileOnly && out.allowOgsUpload) {
+    die('--ogs-reconcile-only cannot be combined with --allow-ogs-upload.');
   }
   if (out.execute && !out.confirm) {
     die('--execute requires --confirm HASH from a dry run.');
@@ -3565,11 +3588,14 @@ async function uploadOgsSgfToAiSensei(page, fsClient, uid, game, sgfBuffer, know
       }
     }
 
-    const knownError = [
+    const illegalMove = bodyText.match(/Move\s+\d+\s+is\s+illegal\.?/i)?.[0] ?? null;
+    const unsupportedGameError = illegalMove ?? [
       'This game is too long to analyze.',
       'Illegal move',
     ].find(t => bodyText.includes(t));
-    if (knownError) return { status: 'UPLOAD_FAILED', error: knownError, retryable: false };
+    if (unsupportedGameError) {
+      return { status: 'SKIP_UNSUPPORTED_GAME', error: unsupportedGameError, retryable: false };
+    }
 
     if (bodyText.includes('Too many requests')) {
       return { status: 'UPLOAD_FAILED', error: 'Too many requests', retryable: true, serviceFailure: true };
@@ -3640,6 +3666,64 @@ async function runOgsImportStage(auth, fsClient, args) {
   console.log('  Exact local board-record matches are skipped before upload; AI Sensei duplicate detection is the fallback authority. The importer never clicks "Reupload game".');
   console.log(`  pacing: local/no-upload ${args.ogsDelayMs} ms; upload-UI ${args.ogsUploadDelayMs} ms; adaptive transient cooldown 30s/60s/120s`);
 
+  let state = null;
+  let initialUploads = null;
+  if (args.ogsReconcileState) {
+    state = await loadOgsImportState();
+    let evidence;
+    try {
+      evidence = JSON.parse(await fs.readFile(args.ogsReconcileState, 'utf8'));
+    } catch (err) {
+      throw new Error(`Could not read OGS reconciliation checkpoint ${args.ogsReconcileState}: ${err.message}`);
+    }
+    initialUploads = await fsClient.allUploads(auth.uid);
+    const knownAiIds = new Set(initialUploads.map(d => docId(d.name)));
+    const reconciled = reconcileOgsImportState(state, evidence, knownAiIds);
+    const smallBoards = classifyPlannedSmallBoards(reconciled.state, plan.games, MIN_OGS_ANALYSIS_BOARD_SIZE);
+    state = smallBoards.state;
+    state.planHash = plan.planHash;
+    state.accounts = plan.accounts;
+    const verification = verifyOgsImportPlanState(state, plan.games, knownAiIds);
+    let reconciliationBackup = null;
+    if (reconciled.changes.length || smallBoards.changes.length) {
+      const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+      reconciliationBackup = path.resolve(`ogs-import-state.pre-reconcile-${stamp}.json`);
+      await fs.copyFile(OGS_IMPORT_STATE_JSON, reconciliationBackup);
+      await saveOgsImportState(state);
+    }
+
+    console.log('\nOGS CHECKPOINT RECONCILIATION');
+    console.log(`  evidence checkpoint:                  ${args.ogsReconcileState}`);
+    console.log(`  live AI Sensei upload IDs:            ${knownAiIds.size}`);
+    console.log(`  restored verified rows:               ${reconciled.changes.length}`);
+    console.log(`  planned small boards classified:      ${smallBoards.changes.length}`);
+    if (reconciliationBackup) console.log(`  pre-reconciliation backup:             ${reconciliationBackup}`);
+    console.log(`  rejected evidence rows:               ${reconciled.rejected.length}`);
+    console.log(`  missing current-plan rows:             ${verification.missingPlanRows.length}`);
+    console.log(`  unresolved current-plan rows:          ${verification.unresolved.length}`);
+    console.log(`  terminal mappings absent from live AI: ${verification.missingAiIds.length}`);
+    console.log(`  checkpoint status counts:             ${JSON.stringify(summarizeOgsImportState(state))}`);
+    if (reconciled.rejected.length) {
+      for (const row of reconciled.rejected.slice(0, 20)) {
+        console.log(`    rejected OGS ${row.ogsGameId}: ${row.status} ${row.aiGameId ?? ''} (${row.reason})`);
+      }
+      if (reconciled.rejected.length > 20) console.log(`    ... ${reconciled.rejected.length - 20} more rejected rows`);
+    }
+    if (verification.missingAiIds.length) {
+      for (const row of verification.missingAiIds.slice(0, 20)) {
+        console.log(`    missing live AI mapping OGS ${row.ogsGameId}: ${row.status} -> ${row.aiGameId ?? '(none)'}`);
+      }
+      if (verification.missingAiIds.length > 20) console.log(`    ... ${verification.missingAiIds.length - 20} more missing mappings`);
+    }
+    if (args.ogsReconcileOnly) {
+      if (verification.missingPlanRows.length || verification.unresolved.length || verification.missingAiIds.length) {
+        throw new Error('OGS checkpoint reconciliation is incomplete; unresolved or non-live AI mappings remain.');
+      }
+      console.log('  reconciliation verification:          COMPLETE');
+      return;
+    }
+  }
+
   if (!args.allowOgsUpload) {
     const extras = [];
     if (Number.isFinite(args.maxOgsGames)) extras.push('--max-ogs-games', String(args.maxOgsGames));
@@ -3660,15 +3744,15 @@ async function runOgsImportStage(auth, fsClient, args) {
     die(`OGS import hash mismatch. Current plan is ${plan.planHash}, but --confirm-ogs was ${args.confirmOgs}. Review the regenerated OGS plan before uploading.`);
   }
 
-  const state = await loadOgsImportState();
+  state ??= await loadOgsImportState();
   state.planHash = plan.planHash;
   state.accounts = plan.accounts;
   const localLibrary = await buildAiSenseiFingerprintIndex(fsClient, auth.uid);
-  const initialUploads = await fsClient.allUploads(auth.uid);
+  initialUploads ??= await fsClient.allUploads(auth.uid);
   const knownAiIds = new Set(initialUploads.map(d => docId(d.name)));
   const ogsClient = new OgsClient();
 
-  const counts = { SKIP_SMALL_BOARD: 0, LOCAL_DUPLICATE: 0, ALREADY_ANALYZED: 0, UPLOADED_NEW: 0, UPLOAD_FAILED: 0, BROWSER_DISCONNECTED: 0, SKIPPED_CHECKPOINT: 0, UPLOAD_PAGE_RECOVERIES: 0, ADAPTIVE_COOLDOWNS: 0 };
+  const counts = { SKIP_SMALL_BOARD: 0, SKIP_UNSUPPORTED_GAME: 0, LOCAL_DUPLICATE: 0, ALREADY_ANALYZED: 0, UPLOADED_NEW: 0, UPLOAD_FAILED: 0, BROWSER_DISCONNECTED: 0, SKIPPED_CHECKPOINT: 0, UPLOAD_PAGE_RECOVERIES: 0, ADAPTIVE_COOLDOWNS: 0 };
   const newlyUploadedAiIds = [];
   let consecutiveServiceFailures = 0;
   let transientFailurePressure = 0;
@@ -3682,6 +3766,11 @@ async function runOgsImportStage(auth, fsClient, args) {
     const game = plan.games[i];
     const key = String(game.id);
     const prior = state.games[key];
+    if (prior?.status === 'SKIP_UNSUPPORTED_GAME') {
+      counts.SKIPPED_CHECKPOINT++;
+      console.log(`  [${i + 1}/${plan.games.length}] OGS ${game.id}: checkpoint SKIP_UNSUPPORTED_GAME${prior.error ? ` (${prior.error})` : ''}`);
+      continue;
+    }
     if (prior?.status === 'SKIP_SMALL_BOARD') {
       const pw = Number(prior.boardWidth ?? prior.boardSize);
       const ph = Number(prior.boardHeight ?? prior.boardSize ?? pw);
@@ -3837,7 +3926,7 @@ async function runOgsImportStage(auth, fsClient, args) {
         consecutiveServiceFailures++;
         transientFailurePressure++;
         adaptiveCooldownMs = transientCooldownMs(transientFailurePressure);
-      } else if (result.status === 'UPLOADED_NEW' || result.status === 'ALREADY_ANALYZED') {
+      } else if (result.status === 'UPLOADED_NEW' || result.status === 'ALREADY_ANALYZED' || result.status === 'SKIP_UNSUPPORTED_GAME') {
         consecutiveServiceFailures = 0;
         transientFailurePressure = 0;
       } else if (result.infrastructureFailure || result.status === 'UPLOAD_FAILED') {
@@ -3943,6 +4032,7 @@ async function runOgsImportStage(auth, fsClient, args) {
   console.log(`  games sent to AI Sensei upload UI:     ${uiUploadGamesThisRun}`);
   console.log(`  pacing used:                          local ${args.ogsDelayMs} ms / upload-UI ${args.ogsUploadDelayMs} ms + adaptive 30s/60s/120s`);
   console.log(`    boards below ${MIN_OGS_ANALYSIS_BOARD_SIZE}x${MIN_OGS_ANALYSIS_BOARD_SIZE} skipped:             ${counts.SKIP_SMALL_BOARD}`);
+  console.log(`    unsupported games skipped:           ${counts.SKIP_UNSUPPORTED_GAME}`);
   console.log(`    local exact duplicates (no upload):  ${counts.LOCAL_DUPLICATE}`);
   console.log(`    already analyzed via AI Sensei UI:   ${counts.ALREADY_ANALYZED}`);
   console.log(`    newly uploaded:                      ${counts.UPLOADED_NEW}`);
