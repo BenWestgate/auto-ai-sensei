@@ -20,6 +20,8 @@ AI Sensei generated game titles are interpreted as `White vs Black`. User aliase
 
 The planner also recognizes AI Sensei's teaching-game human label as the user's side, and recognizes its normal-game human label only when the opponent clearly looks like an AI/bot. Ambiguous identity is skipped rather than guessed.
 
+Some imported games do not have a `:games/<id>` document even after analysis completes. For those records only, the planner may recover metadata from a completed `:game-data/<uid>/:uploads/<id>` document and reconstruct the played main line from `:game-data/<uid>/:nodes/<id>`. Recovery requires a usable square board size, both player names, a completed upload status, and a valid node-chain main line. If any of those checks fail, the game remains skipped. Unknown rank marker `?` is treated as absent rank metadata, not as part of a player's identity.
+
 ## Move indexing
 
 This is a critical invariant:

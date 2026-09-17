@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { invokedScriptPath } from '../src/cli/commands.mjs';
 
 const script = path.resolve('src/ai-sensei.mjs');
 const source = readFileSync(script, 'utf8');
@@ -42,4 +43,15 @@ test('GoQuest discovery requires an explicit account', () => {
   const result = run('--goquest-import');
   assert.equal(result.status, 1);
   assert.match(source, /--goquest-import requires at least one --goquest-account NAME/);
+});
+
+test('reviewed commands preserve the invoked src entrypoint', () => {
+  assert.equal(
+    invokedScriptPath({ cwd: '/repo', argv1: '/repo/src/ai-sensei.mjs' }),
+    'src/ai-sensei.mjs',
+  );
+  assert.equal(
+    invokedScriptPath({ cwd: '/repo', argv1: '/repo/tools/custom-entry.mjs' }),
+    'tools/custom-entry.mjs',
+  );
 });

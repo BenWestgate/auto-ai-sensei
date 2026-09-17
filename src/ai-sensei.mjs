@@ -80,6 +80,18 @@ import process from 'node:process';
 import { gunzipSync, unzipSync, inflateSync } from 'node:zlib';
 import { createRequire } from 'node:module';
 import { chromium } from 'playwright';
+import { invokedScriptPath } from './cli/commands.mjs';
+import {
+  MIN_POINT_LOSS,
+  MIN_WR_DROP,
+  TOP_POINT_LOSS_CANDIDATES,
+  analysisTransitionForMove,
+  chooseCanonicalFromTop3,
+  directProblemColorAtMove,
+  qualifiesPracticeFloor,
+  selectTopDistinctByFirstSolutionMove,
+} from './cleanup/policy.mjs';
+import { importedGameMetadataFromUploadFields } from './games/imported-game.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -94,13 +106,9 @@ const PLAN_CSV = path.resolve('cleanup-plan.csv');
 const DELETE_BATCH_SIZE = 200;
 const CREATE_BATCH_SIZE = 100;
 const ANALYSIS_CONCURRENCY = 8;
-const MIN_POINT_LOSS = 1.0;
-const MIN_WR_DROP = 0.02;
 const DECISIVE = 0.90;
 const LIVE_GAME = 0.10;
 const MATERIAL_WR_DROP = 0.10;
-const POSITION_TO_ACTUAL_MOVE_OFFSET = 0; // Firestore :move-number is the target move itself, not the preceding position.
-const TOP_POINT_LOSS_CANDIDATES = 3;
 const DEFAULT_PLAYER_NAMES = Object.freeze([]);
 
 const DEFAULT_OGS_ACCOUNTS = Object.freeze([]);
@@ -252,7 +260,7 @@ GoQuest discovery stage (intentionally read-only):
 Examples:
   node src/ai-sensei.mjs --me YOUR_HANDLE --max-games 20 --verbose
   node src/ai-sensei.mjs --cdp http://127.0.0.1:9222 --me YOUR_HANDLE --max-games 20
-  node src/ai-sensei.mjs --me YOUR_HANDLE --execute --confirm 8ab12cd34ef5
+  node src/ai-sensei.mjs --me YOUR_HANDLE --execute --allow-create --confirm 8ab12cd34ef5
   node src/ai-sensei.mjs --cdp http://127.0.0.1:9222 --ogs-import --ogs-account YOUR_OGS_HANDLE --max-ogs-games 20
   node src/ai-sensei.mjs --goquest-import --goquest-account YOUR_GOQUEST_HANDLE
 `);
@@ -755,8 +763,8 @@ function stripTrailingRank(label) {
   let s = normalizeName(label);
   // AI Sensei game titles can append either a Go rank ("7k", "1d") or a
   // numeric server rating ("(1671)", "(1891)"). Strip those suffixes only.
-  // Exact matching after suffix removal is important because "Me" is a literal
-  // user handle and must not substring-match unrelated player names.
+  // Exact matching after suffix removal is important because short aliases
+  // must not substring-match unrelated player names.
   let prev;
   do {
     prev = s;
@@ -983,8 +991,7 @@ function inferColorFromNearestNodes(actualMoveNumber, gameNodes) {
 }
 
 function resolveProblemColor(actualMoveNumber, game, gameNodes, alternatingMap) {
-  const actualNode = gameNodes?.byId?.get(actualMoveNumber);
-  const direct = normalizeColor(actualNode?.[':color']);
+  const direct = normalizeColor(directProblemColorAtMove(actualMoveNumber, gameNodes?.byId));
   if (direct) return { color: direct, source: 'DIRECT_NODE' };
 
   // Firestore :move-number identifies the move being trained. Prefer that
@@ -1492,9 +1499,9 @@ function evaluateCandidate(uniqueMove, analysis, gameNodeMap, myColor) {
   // AI Sensei memo :move-number is the move being trained. The analysis maps
   // are board positions: position 0 is the root, position N is after move N.
   // Therefore the loss caused by target move N is measured from N-1 -> N.
-  const actualMove = uniqueMove.moveNumber + POSITION_TO_ACTUAL_MOVE_OFFSET;
-  const beforePosition = actualMove - 1;
-  if (!Number.isInteger(actualMove) || actualMove < 1 || beforePosition < 0) {
+  const transition = analysisTransitionForMove(uniqueMove.moveNumber);
+  const { actualMove, beforePosition } = transition;
+  if (!transition.ok) {
     return { ok: false, reason: 'INVALID_TARGET_MOVE_NUMBER', actualMove, beforePosition };
   }
 
@@ -2045,27 +2052,6 @@ function buildSolutionIndexFromPlainDocs(plainDocs, boardSize = 19) {
     if (best) out.set(position, best);
   }
   return out;
-}
-
-function solutionKeyFromFirstMove(move) {
-  return move ? `first=${move}` : null;
-}
-
-function qualifiesPracticeFloor(candidate) {
-  return candidate.pointLoss >= MIN_POINT_LOSS || (Number.isFinite(candidate.winrateDrop) && candidate.winrateDrop >= MIN_WR_DROP);
-}
-
-function chooseCanonicalFromTop3(top3) {
-  const qualifying = top3.filter(qualifiesPracticeFloor);
-  if (!qualifying.length) return { keeper: null, qualifying: [], ranked: [] };
-  const ranked = [...qualifying].sort((a, b) => {
-    const aw = Number.isFinite(a.winrateDrop) ? a.winrateDrop : -1;
-    const bw = Number.isFinite(b.winrateDrop) ? b.winrateDrop : -1;
-    if (bw !== aw) return bw - aw;
-    if (b.pointLoss !== a.pointLoss) return b.pointLoss - a.pointLoss;
-    return a.moveNumber - b.moveNumber;
-  });
-  return { keeper: ranked[0], qualifying, ranked };
 }
 
 // ------------------------------ GoQuest discovery stage ------------------------------
@@ -3001,9 +2987,33 @@ function aiGameRecordFromNodeDoc(game, nodeDoc) {
   return { boardWidth: game.boardSize, boardHeight: game.boardSize, boardSize: game.boardSize, blackSetup, whiteSetup, moves };
 }
 
+function recoverImportedGameFromUpload(uploadDoc, nodeDoc) {
+  if (!uploadDoc) return { ok: false, reason: 'MISSING_GAME_DOCUMENT' };
+  const fields = decodeFsFields(uploadDoc.fields);
+  const metadata = importedGameMetadataFromUploadFields(fields, {
+    id: docId(uploadDoc.name),
+    docName: uploadDoc.name,
+    updateTime: uploadDoc.updateTime ?? null,
+  });
+  if (!metadata.ok) return metadata;
+  if (!nodeDoc) return { ok: false, reason: 'NO_ANALYSIS_NODE_DOCUMENT' };
+  const record = aiGameRecordFromNodeDoc(metadata.game, nodeDoc);
+  if (!record) return { ok: false, reason: 'UPLOAD_NODE_MAIN_LINE_UNUSABLE' };
+  return {
+    ok: true,
+    game: {
+      ...metadata.game,
+      moves: record.moves,
+      metadataSource: 'UPLOAD_SGF_INFO+GAME_DATA_NODE_CHAIN',
+    },
+    record,
+  };
+}
+
 async function buildAiSenseiFingerprintIndex(fsClient, uid) {
   console.log('Building local AI Sensei game fingerprint index...');
   const uploads = await fsClient.allUploads(uid);
+  const uploadsById = new Map(uploads.map(d => [docId(d.name), d]));
   const ids = [...new Set(uploads.map(d => docId(d.name)).filter(Boolean))];
   const names = ids.map(id => `${FIRESTORE_ROOT}/:games/${id}`);
   const docs = await fsClient.batchGetChunked(names);
@@ -3019,7 +3029,14 @@ async function buildAiSenseiFingerprintIndex(fsClient, uid) {
   for (const id of ids) {
     const doc = docs.get(`${FIRESTORE_ROOT}/:games/${id}`);
     if (!doc) {
-      unresolved.push({ id, game: null });
+      const uploadDoc = uploadsById.get(id);
+      const fields = uploadDoc ? decodeFsFields(uploadDoc.fields) : null;
+      const metadata = fields ? importedGameMetadataFromUploadFields(fields, {
+        id,
+        docName: uploadDoc.name,
+        updateTime: uploadDoc.updateTime ?? null,
+      }) : { ok: false };
+      unresolved.push({ id, game: metadata.ok ? metadata.game : null });
       continue;
     }
     const game = parseGameDoc(doc);
@@ -3634,7 +3651,7 @@ async function runOgsImportStage(auth, fsClient, args) {
     if (args.waitAnalysisMinutes !== 10) extras.push('--wait-analysis-minutes', String(args.waitAnalysisMinutes));
     if (args.ogsUploadTimeoutMs !== OGS_UPLOAD_TIMEOUT_MS) extras.push('--ogs-upload-timeout-seconds', String(Math.round(args.ogsUploadTimeoutMs / 1000)));
     if (args.ogsUploadAttempts !== OGS_UPLOAD_ATTEMPTS) extras.push('--ogs-upload-attempts', String(args.ogsUploadAttempts));
-    const scriptName = path.basename(process.argv[1] ?? 'ai-sensei.mjs');
+    const scriptName = invokedScriptPath();
     console.log(`\nDRY RUN ONLY. No OGS game was uploaded.\nReviewed import command:\n  node ${shellQuote(scriptName)}${args.cdpUrl ? ` --cdp ${shellQuote(args.cdpUrl)}` : ''} --ogs-import${extras.length ? ` ${extras.join(' ')}` : ''} --allow-ogs-upload --confirm-ogs ${plan.planHash}\n`);
     return;
   }
@@ -4024,6 +4041,7 @@ async function buildPlan(fsClient, uid, args) {
 
   console.log('Fetching game history index...');
   const uploadDocs = await fsClient.allUploads(uid);
+  const uploadDocsById = new Map(uploadDocs.map(d => [docId(d.name), d]));
   const memoGameIds = parsedMemos.filter(m => m.gameId).map(m => m.gameId);
   const historyIds = [...new Set([...uploadDocs.map(d => docId(d.name)), ...memoGameIds])].sort();
   console.log(`Historical games discovered: ${historyIds.length}`);
@@ -4044,15 +4062,22 @@ async function buildPlan(fsClient, uid, args) {
   ]);
 
   const prepared = [];
+  let recoveredImportedGames = 0;
   for (const gameId of selectedIds) {
     const gameMemos = memoGroups.get(gameId) ?? [];
     const gameDoc = gameDocsByName.get(`${FIRESTORE_ROOT}/:games/${gameId}`);
     const nodeDoc = gameNodeDocsByName.get(`${FIRESTORE_ROOT}/:game-data/${uid}/:nodes/${gameId}`);
-    const game = gameDoc ? parseGameDoc(gameDoc) : null;
+    let game = gameDoc ? parseGameDoc(gameDoc) : null;
     const gameNodes = nodeDoc ? parseGameNodeDoc(nodeDoc) : null;
     if (!game) {
-      prepared.push({ gameId, gameMemos, game, gameNodes, fatal: 'MISSING_GAME_DOCUMENT' });
-      continue;
+      const recovered = recoverImportedGameFromUpload(uploadDocsById.get(gameId), nodeDoc);
+      if (recovered.ok) {
+        game = recovered.game;
+        recoveredImportedGames++;
+      } else {
+        prepared.push({ gameId, gameMemos, game, gameNodes, fatal: recovered.reason ?? 'MISSING_GAME_DOCUMENT' });
+        continue;
+      }
     }
     const who = playerColorFromGameName(game.name, args.me);
     if (!who.color) {
@@ -4090,6 +4115,10 @@ async function buildPlan(fsClient, uid, args) {
       gameId, gameMemos: annotatedMemos, game, gameNodes, myColor: who.color,
       colorByMove, alternatingColorMap, fatal: null,
     });
+  }
+
+  if (recoveredImportedGames) {
+    console.log(`Recovered ${recoveredImportedGames} imported games from completed upload metadata + node chains.`);
   }
 
   const toAnalyze = prepared.filter(g => !g.fatal);
@@ -4132,24 +4161,21 @@ async function buildPlan(fsClient, uid, args) {
         return;
       }
 
-      const sorted = [...mine].sort((a, b) => b.pointLoss - a.pointLoss || a.moveNumber - b.moveNumber);
-      const top3 = [];
-      const seenSolutions = new Set();
-      for (const c of sorted) {
+      const candidatesWithSolutions = mine.map(c => {
         const sol = solutionIndex.get(c.moveNumber - 1);
-        if (!sol?.firstMove) {
-          if (top3.length < TOP_POINT_LOSS_CANDIDATES) {
-            g.analysisError = `MISSING_BEST_MOVE_FOR_TOP3@position${c.moveNumber - 1}`;
-            return;
-          }
-          break;
-        }
-        const solutionKey = solutionKeyFromFirstMove(sol.firstMove);
-        if (seenSolutions.has(solutionKey)) continue;
-        seenSolutions.add(solutionKey);
-        top3.push({ ...c, solutionMove: sol.firstMove, solutionKey, solutionSource: sol.source, pv: sol.pv });
-        if (top3.length >= TOP_POINT_LOSS_CANDIDATES) break;
+        return {
+          ...c,
+          solutionMove: sol?.firstMove ?? null,
+          solutionSource: sol?.source ?? null,
+          pv: sol?.pv ?? null,
+        };
+      });
+      const distinct = selectTopDistinctByFirstSolutionMove(candidatesWithSolutions);
+      if (distinct.error) {
+        g.analysisError = distinct.error;
+        return;
       }
+      const top3 = distinct.top;
       if (!top3.length) {
         g.analysisError = 'NO_DISTINCT_SOLUTION_CANDIDATES';
         return;
@@ -4493,7 +4519,7 @@ async function main() {
 
     if (!args.execute) {
       const replay = replayCliArgs(args);
-      const scriptName = path.basename(process.argv[1] ?? 'ai-sensei.mjs');
+      const scriptName = invokedScriptPath();
       const createNote = plan.createMemos.length
         ? `\nCREATE execution is intentionally gated. After validating the derived first moves, execution additionally requires --allow-create.`
         : '';
@@ -4512,7 +4538,12 @@ async function main() {
   }
 }
 
-main().catch(err => {
+main().then(() => {
+  // A Playwright CDP attachment keeps its transport referenced even after all
+  // CLI work is complete. Exit the CLI without closing the externally-owned
+  // Chromium instance.
+  process.exit(0);
+}).catch(err => {
   console.error(err?.stack ?? err);
   process.exit(1);
 });
