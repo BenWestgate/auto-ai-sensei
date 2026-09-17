@@ -38,6 +38,14 @@ Do not introduce a `+1` offset when refactoring this logic.
 
 When the selected canonical problem differs from what is saved, execution creates and verifies the replacement before deleting the old memo. Deletes use Firestore `updateTime` preconditions. A raw memo backup is written before mutation.
 
+## Memo backup restore
+
+Raw `memos-backup-*.json` snapshots are restorable with `--restore-memos-backup PATH`. Restore is dry-run first and writes `memo-restore-plan.json`; execution requires `--execute --confirm HASH` for the freshly generated plan.
+
+Backups are validated before planning: their memo count must match, document names must be unique and confined to the authenticated user's `:memos` collection, and any recorded Firebase UID / Firestore root must match the active account. Legacy backups without the newer metadata remain valid when their document paths prove the same user and database.
+
+Restore reconciles raw Firestore fields exactly. Missing and changed backed-up documents are created/replaced first with optimistic Firestore preconditions. The library is then re-read, and no post-backup document is deleted unless every backed-up document is already present with the exact backed-up fields. Deletes use the freshly observed `updateTime` preconditions. A final full re-read must produce zero restore mutations and the exact backed-up memo count.
+
 ## Dry-run gates
 
 Cleanup and OGS import are dry-run first. A plan hash is generated from the current plan and must be supplied back to the mutation command. A stale hash must fail after the plan changes.

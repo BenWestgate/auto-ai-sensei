@@ -91,6 +91,12 @@ import {
   qualifiesPracticeFloor,
   selectTopDistinctByFirstSolutionMove,
 } from './cleanup/policy.mjs';
+import {
+  buildMemoRestorePlan,
+  memoRestoreAudit,
+  splitMemoRestoreActions,
+  validateMemoBackup,
+} from './cleanup/memo-backup.mjs';
 import { importedGameMetadataFromUploadFields } from './games/imported-game.mjs';
 import {
   classifyPlannedSmallBoards,
@@ -109,6 +115,7 @@ const FIREBASE_GMPID = '1:670187203450:web:08f09dc683cc81772384c3';
 const PROFILE_DIR = path.resolve('.ai-sensei-playwright-profile');
 const PLAN_JSON = path.resolve('cleanup-plan.json');
 const PLAN_CSV = path.resolve('cleanup-plan.csv');
+const MEMO_RESTORE_PLAN_JSON = path.resolve('memo-restore-plan.json');
 const DELETE_BATCH_SIZE = 200;
 const CREATE_BATCH_SIZE = 100;
 const ANALYSIS_CONCURRENCY = 8;
@@ -190,6 +197,7 @@ function parseArgs(argv) {
     goquestTimeoutMs: GOQUEST_REQUEST_TIMEOUT_MS,
     goquestGameCaptureTimeoutMs: GOQUEST_GAME_CAPTURE_TIMEOUT_MS,
     goquestChromiumPath: GOQUEST_DEFAULT_CHROMIUM,
+    restoreMemosBackup: null,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -221,6 +229,7 @@ function parseArgs(argv) {
     else if (a === '--goquest-timeout-seconds') out.goquestTimeoutMs = Number(argv[++i]) * 1000;
     else if (a === '--goquest-game-timeout-seconds') out.goquestGameCaptureTimeoutMs = Number(argv[++i]) * 1000;
     else if (a === '--goquest-chromium') out.goquestChromiumPath = path.resolve(argv[++i] ?? GOQUEST_DEFAULT_CHROMIUM);
+    else if (a === '--restore-memos-backup') out.restoreMemosBackup = path.resolve(argv[++i] ?? '');
     else if (a === '--help' || a === '-h') {
       console.log(`
 Auto AI Sensei
@@ -236,6 +245,11 @@ Optional:
                          Recommended when Google blocks automated sign-in.
   --headless             Only works after the Playwright profile is already logged in.
   --verbose              Print additional schema-detection details.
+
+Memo backup restore (runs instead of cleanup planning):
+  --restore-memos-backup PATH
+                         Reconcile the live memo library exactly to a raw memos-backup-*.json
+                         snapshot. Dry-run by default; use --execute --confirm HASH to apply.
 
 OGS import stage (runs instead of cleanup planning):
   --ogs-import            Discover completed, non-annulled OGS games for the account(s)
@@ -275,6 +289,7 @@ Examples:
   node src/ai-sensei.mjs --me YOUR_HANDLE --max-games 20 --verbose
   node src/ai-sensei.mjs --cdp http://127.0.0.1:9222 --me YOUR_HANDLE --max-games 20
   node src/ai-sensei.mjs --me YOUR_HANDLE --execute --allow-create --confirm 8ab12cd34ef5
+  node src/ai-sensei.mjs --cdp http://127.0.0.1:9222 --restore-memos-backup memos-backup-20260917T220000Z.json
   node src/ai-sensei.mjs --cdp http://127.0.0.1:9222 --ogs-import --ogs-account YOUR_OGS_HANDLE --max-ogs-games 20
   node src/ai-sensei.mjs --goquest-import --goquest-account YOUR_GOQUEST_HANDLE
 `);
@@ -291,7 +306,7 @@ Examples:
   out.ogsAccounts = [...new Set(out.ogsAccounts.map(s => s.trim()).filter(Boolean))];
   out.goquestAccounts = [...new Set(out.goquestAccounts.map(s => s.trim()).filter(Boolean))];
   out.goquestGtypes = [...new Set(out.goquestGtypes.map(s => s.trim().toLowerCase()).filter(Boolean))];
-  if (!out.ogsImport && !out.goquestImport && !out.me.length) {
+  if (!out.ogsImport && !out.goquestImport && !out.restoreMemosBackup && !out.me.length) {
     die('cleanup requires at least one --me NAME so your moves can be identified safely.');
   }
   if (out.maxOgsGames !== null && (!Number.isFinite(out.maxOgsGames) || out.maxOgsGames <= 0)) {
@@ -325,6 +340,12 @@ Examples:
   }
   if (out.ogsImport && out.goquestImport) {
     die('--ogs-import and --goquest-import are separate stages; choose one.');
+  }
+  if (out.restoreMemosBackup && (out.ogsImport || out.goquestImport)) {
+    die('--restore-memos-backup is a separate stage; do not combine it with import stages.');
+  }
+  if (out.restoreMemosBackup && out.allowCreate) {
+    die('--allow-create is a cleanup-only flag and cannot be combined with --restore-memos-backup.');
   }
   if (out.goquestImport && out.execute) {
     die('--goquest-import is a read-only discovery stage and cannot be combined with cleanup --execute.');
@@ -1926,6 +1947,32 @@ class FirestoreClient {
         delete: m.docName,
         currentDocument: { updateTime: m.updateTime },
       };
+    });
+    return this.post(url, { writes });
+  }
+
+  async commitMemoRestore(actions) {
+    if (!actions.length) return null;
+    const url = `${FIRESTORE_BASE}:commit`;
+    const writes = actions.map(row => {
+      if (row.action === 'CREATE') {
+        return {
+          update: { name: row.name, fields: row.desired.fields },
+          currentDocument: { exists: false },
+        };
+      }
+      if (row.action === 'REPLACE') {
+        if (!row.currentUpdateTime) throw new Error(`Restore replacement ${row.name} is missing updateTime`);
+        return {
+          update: { name: row.name, fields: row.desired.fields },
+          currentDocument: { updateTime: row.currentUpdateTime },
+        };
+      }
+      if (row.action === 'DELETE') {
+        if (!row.currentUpdateTime) throw new Error(`Restore deletion ${row.name} is missing updateTime`);
+        return { delete: row.name, currentDocument: { updateTime: row.currentUpdateTime } };
+      }
+      throw new Error(`Unsupported memo restore action: ${row.action}`);
     });
     return this.post(url, { writes });
   }
@@ -4523,8 +4570,94 @@ function printSummary(plan, hash) {
 async function writeMemoBackup(plan) {
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
   const file = path.resolve(`memos-backup-${stamp}.json`);
-  await fs.writeFile(file, JSON.stringify({ generatedAt: new Date().toISOString(), memoCount: plan.rawMemoDocs.length, documents: plan.rawMemoDocs }, null, 2));
+  await fs.writeFile(file, JSON.stringify({
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    uid: plan.uid,
+    firestoreRoot: FIRESTORE_ROOT,
+    memoCount: plan.rawMemoDocs.length,
+    documents: plan.rawMemoDocs,
+  }, null, 2));
   return file;
+}
+
+async function loadMemoBackup(file) {
+  try {
+    return JSON.parse(await fs.readFile(file, 'utf8'));
+  } catch (err) {
+    throw new Error(`Could not read memo backup ${file}: ${err.message}`);
+  }
+}
+
+async function runMemoRestoreStage(fsClient, uid, args) {
+  const backup = await loadMemoBackup(args.restoreMemosBackup);
+  validateMemoBackup(backup, { firestoreRoot: FIRESTORE_ROOT, uid });
+  const currentDocs = await fsClient.allMemos(uid);
+  const plan = buildMemoRestorePlan(backup, currentDocs, { firestoreRoot: FIRESTORE_ROOT, uid });
+  await fs.writeFile(MEMO_RESTORE_PLAN_JSON, JSON.stringify({
+    backupFile: args.restoreMemosBackup,
+    ...memoRestoreAudit(plan),
+  }, null, 2));
+
+  console.log('\nMEMO RESTORE PLAN');
+  console.log(`  backup:                 ${args.restoreMemosBackup}`);
+  console.log(`  backup memo count:      ${plan.backupMemoCount}`);
+  console.log(`  current memo count:     ${plan.currentMemoCount}`);
+  console.log(`  create missing:         ${plan.counts.CREATE}`);
+  console.log(`  replace changed:        ${plan.counts.REPLACE}`);
+  console.log(`  delete post-backup:     ${plan.counts.DELETE}`);
+  console.log(`  already identical:      ${plan.counts.UNCHANGED}`);
+  console.log(`  plan hash:              ${plan.planHash}`);
+  console.log(`  audit file:             ${MEMO_RESTORE_PLAN_JSON}`);
+
+  if (!args.execute) {
+    const scriptName = invokedScriptPath();
+    const authArgs = args.cdpUrl
+      ? ` --cdp ${shellQuote(args.cdpUrl)}`
+      : `${args.headless ? ' --headless' : ''}${path.resolve(args.profileDir) !== PROFILE_DIR ? ` --profile-dir ${shellQuote(args.profileDir)}` : ''}`;
+    console.log(`\nDRY RUN ONLY. Nothing was changed.\nReviewed restore command:\n  node ${shellQuote(scriptName)}${authArgs} --restore-memos-backup ${shellQuote(args.restoreMemosBackup)} --execute --confirm ${plan.planHash}\n`);
+    return;
+  }
+  if (args.confirm !== plan.planHash) {
+    die(`Memo restore hash mismatch. Current restore plan is ${plan.planHash}, but --confirm was ${args.confirm}. Review the regenerated restore plan before executing.`);
+  }
+  if (!plan.mutationCount) {
+    console.log('Backup is already fully restored; no writes are required.');
+    return;
+  }
+
+  const phases = splitMemoRestoreActions(plan.actions);
+  console.log(`Restoring ${phases.restore.length} missing/changed memo documents with optimistic preconditions...`);
+  for (let i = 0; i < phases.restore.length; i += CREATE_BATCH_SIZE) {
+    const batch = phases.restore.slice(i, i + CREATE_BATCH_SIZE);
+    await fsClient.commitMemoRestore(batch);
+    console.log(`  restored ${Math.min(i + batch.length, phases.restore.length)}/${phases.restore.length}`);
+  }
+
+  console.log('Re-reading problem library before any post-backup deletions...');
+  const preDeleteDocs = await fsClient.allMemos(uid);
+  const preDeletePlan = buildMemoRestorePlan(backup, preDeleteDocs, { firestoreRoot: FIRESTORE_ROOT, uid });
+  if (preDeletePlan.counts.CREATE !== 0 || preDeletePlan.counts.REPLACE !== 0) {
+    throw new Error(`Memo restore halted before deletion: ${preDeletePlan.counts.CREATE} creates and ${preDeletePlan.counts.REPLACE} replacements are still required.`);
+  }
+
+  const preDeletePhases = splitMemoRestoreActions(preDeletePlan.actions);
+  if (preDeletePhases.deletions.length) {
+    console.log(`Deleting ${preDeletePhases.deletions.length} memo documents created after the backup...`);
+    for (let i = 0; i < preDeletePhases.deletions.length; i += DELETE_BATCH_SIZE) {
+      const batch = preDeletePhases.deletions.slice(i, i + DELETE_BATCH_SIZE);
+      await fsClient.commitMemoRestore(batch);
+      console.log(`  deleted ${Math.min(i + batch.length, preDeletePhases.deletions.length)}/${preDeletePhases.deletions.length}`);
+    }
+  }
+
+  console.log('Re-reading problem library for exact backup verification...');
+  const verifiedDocs = await fsClient.allMemos(uid);
+  const verification = buildMemoRestorePlan(backup, verifiedDocs, { firestoreRoot: FIRESTORE_ROOT, uid });
+  if (verification.mutationCount !== 0 || verification.currentMemoCount !== verification.backupMemoCount) {
+    throw new Error(`Memo restore verification failed: ${verification.mutationCount} differences remain.`);
+  }
+  console.log(`Memo restore verified: ${verification.backupMemoCount} documents exactly match the backup fields.`);
 }
 
 async function verifyCreates(fsClient, creates, uid) {
@@ -4601,6 +4734,10 @@ async function main() {
     const fsClient = new FirestoreClient(auth);
     if (args.ogsImport) {
       await runOgsImportStage(auth, fsClient, args);
+      return;
+    }
+    if (args.restoreMemosBackup) {
+      await runMemoRestoreStage(fsClient, auth.uid, args);
       return;
     }
     const plan = await buildPlan(fsClient, auth.uid, args);

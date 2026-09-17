@@ -17,6 +17,7 @@ goquest-game-payloads-raw.json
 goquest-linkage-plan.json
 goquest-linkage-plan.csv
 memos-backup-*.json
+memo-restore-plan.json
 
 # Diagnostics and captures may contain account/session data.
 *-diagnostic-*.json
