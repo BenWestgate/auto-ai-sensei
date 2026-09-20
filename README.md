@@ -72,13 +72,25 @@ cleanup-plan.json
 cleanup-plan.csv
 ```
 
-The current policy considers only your moves, de-duplicates mistakes by the AI's first solution move, looks at the top three distinct mistakes by point loss, and selects at most one problem when it loses at least 1 point or 2 percentage points of win rate. Ambiguous games are skipped rather than guessed.
+The curation policy follows AI Sensei's own rank-aware Quiz behavior instead of a fixed loss threshold:
+
+1. Resolve the player's teaching rank from the game-time SGF rank, AI Rank Prediction, current OGS rank, then `10k` as a final fallback.
+2. Open Start Quiz for the player's color, sort by point loss, enable Avoid same move, and begin at that normal rank.
+3. If fewer than three Quiz problems exist, strengthen the student level one step at a time until at least three appear or the slider reaches its maximum.
+4. Reconcile the Quiz count against the analyzed moves and take up to the three largest distinct point-loss mistakes.
+5. Rank those candidates by positive win-rate loss first; if win-rate loss is unavailable/zero for all of them, use point loss. Ties use point loss, then earlier move number.
+6. For wins, draws, and unknown results, a temporary-rank candidate must still be bad at the normal rank: Inaccuracy/Mistake/Blunder in point mode, or Mistake/Blunder in win-rate mode. Losses remain eligible even when the normal-rank label becomes Good.
+
+For the chosen position, the saved solution set contains every normal-rank point-good first move except moves that win-rate mode explicitly marks Mistake or Blunder, plus the KataGo best first move. The script stores first moves only; it does not synthesize continuations. If exact Good Move synchronization cannot be read, an existing memo is left unchanged and marked `RETRY_SOLUTION_SYNC`; a new problem may be created with the best move only so the position is not silently lost.
+
+For a lost game, the planner always tries to produce a teaching problem. If the Quiz has zero problems even at the strongest student level, it falls back to the player's worst own move by positive win-rate loss, then point loss. If the played move itself is considered Good at the player's normal rank, it is removed from the teaching solutions when a better Good alternative exists.
 
 Review the CSV before doing anything else. The important actions are:
 
 - `KEEP`: already the desired canonical problem;
 - `CREATE`: create the selected canonical problem;
-- `DELETE`: remove a superseded/opponent/below-floor problem;
+- `UPDATE`: keep the same memo/position and replace only its accepted first-move solution set;
+- `DELETE`: remove a superseded/opponent/no-longer-selected problem;
 - `SKIP`: identity or analysis was not safe to infer;
 - `NONE`: the game correctly needs no saved problem.
 
@@ -93,7 +105,7 @@ node src/ai-sensei.mjs \
   --confirm PLAN_HASH_FROM_DRY_RUN
 ```
 
-`--allow-create` is required only when the reviewed plan contains `CREATE` rows. Execution writes a memo backup, creates and verifies replacements first, then performs guarded deletes. If the plan changes, the old hash is rejected.
+`--allow-create` is required only when the reviewed plan contains `CREATE` rows. Execution writes a memo backup, creates replacements and applies same-position solution updates with Firestore preconditions, verifies all creates/updates, and only then performs guarded deletes. Same-position `UPDATE` preserves the memo ID and training fields. If the plan changes, the old hash is rejected.
 
 For a small first pass, add `--max-games 20 --verbose` to the dry run.
 
@@ -119,7 +131,7 @@ After review, use the command printed by the dry run. Its mutation gates are:
 --confirm-ogs PLAN_HASH
 ```
 
-The importer checkpoints completed work in `ogs-import-state.json`, so interrupted runs can resume. It fingerprints board records before opening the upload UI, skips boards where either dimension is below 7, and never automates AI Sensei's "Reupload game" choice.
+The importer checkpoints completed work in `ogs-import-state.json`, so interrupted runs can resume. Across all supplied OGS accounts, the merged import plan is globally oldest-to-newest by game end time, then game ID; `--max-ogs-games` is applied after that sort. It fingerprints board records before opening the upload UI, skips boards where either dimension is below 7, and never automates AI Sensei's "Reupload game" choice.
 
 After imported games finish analysis, run the normal curation dry run again so they can contribute practice problems.
 
@@ -139,15 +151,7 @@ GoQuest upload is not implemented.
 
 ## Customize the curation policy
 
-The policy is intentionally code-defined rather than silently configurable. The main constants near the top of `src/ai-sensei.mjs` are:
-
-```js
-const MIN_POINT_LOSS = 1.0;
-const MIN_WR_DROP = 0.02;
-const TOP_POINT_LOSS_CANDIDATES = 3;
-```
-
-If you fork the project to use different study criteria, change those constants, run `npm test`, generate a fresh dry-run plan, and inspect the resulting `CREATE`/`DELETE` rows. Never reuse a plan hash from an older policy or analysis state.
+The rank/Quiz rules are implemented in `src/cleanup/policy.mjs`, while browser reconciliation is in `src/ai-sensei.mjs`. If you fork the project to use different study criteria, change the policy, run `npm test && npm run check`, generate a fresh dry-run plan, and inspect the resulting `CREATE`/`UPDATE`/`DELETE` rows. Never reuse a plan hash from an older policy or analysis state.
 
 ## Generated and sensitive files
 

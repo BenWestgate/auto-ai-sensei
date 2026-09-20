@@ -10,6 +10,7 @@ cleanup-plan.csv
 ogs-import-plan.json
 ogs-import-plan.csv
 ogs-import-state.json
+ogs-import-state.pre-reconcile-*.json
 goquest-import-plan.json
 goquest-import-plan.csv
 goquest-profile-probe-raw.json

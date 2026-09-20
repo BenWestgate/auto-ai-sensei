@@ -6,13 +6,19 @@ Auto AI Sensei grew from a personal cleanup/import script. This document records
 
 For every eligible game, the planner keeps at most one practice problem from the user's own moves.
 
-1. Rank mistakes by point loss.
-2. De-duplicate candidates by the first move of the AI solution.
-3. Keep the top three distinct candidates.
-4. A candidate qualifies at `>= 1.0` point loss **or** `>= 2` percentage points of win-rate loss.
-5. Among qualifying top-three candidates, prefer larger win-rate loss, then larger point loss, then earlier move number.
+1. Resolve the normal student rank in this order: game-time SGF/rank metadata, AI Sensei AI Rank Prediction, current OGS rank, then `10k`.
+2. Configure AI Sensei Start Quiz for the user's color with point-loss sorting and Avoid same move enabled.
+3. If the normal rank exposes fewer than three Quiz problems, strengthen one student level at a time and stop at the first level with at least three; if the strongest level still exposes one or two, use those.
+4. Reconcile the Quiz count against analysis and keep the top three distinct first-solution candidates by point loss.
+5. For wins/draws/unknown results, retain only candidates that are still bad at the normal rank. Point mode accepts Inaccuracy/Mistake/Blunder. Win-rate mode counts only Mistake/Blunder as bad. Losses do not require this normal-rank gate.
+6. Rank the remaining candidates by largest positive win-rate loss. If all win-rate losses are zero/unavailable, use point loss. Ties use larger point loss, then earlier move number.
+7. A loss with zero Quiz problems at the strongest level falls back to the user's worst own move by the same impact ranking.
 
-If no candidate qualifies, the desired state is zero saved problems for that game.
+Exact browser truth is required for rank/Quiz curation. If Quiz count/candidate reconciliation cannot be read, the game fails closed and its existing memos are not mutated.
+
+The accepted solution set is also rank-aware. At the normal rank, take every point-good first move, veto only alternatives that win-rate mode explicitly marks Mistake or Blunder, and always include the KataGo best first move. Store first moves only. If solution enumeration is unreadable, preserve an existing memo unchanged and flag `RETRY_SOLUTION_SYNC`; for a brand-new problem, best-move-only creation is allowed so the position can be retried later.
+
+For losses, if the played move is itself in the accepted Good set, remove it when a better Good alternative exists. Try the next-ranked candidate if that leaves no teaching solution. The played move may remain only as the final fallback when it is itself the sole best/acceptable move and no alternative position works.
 
 ## Identity handling
 
@@ -36,7 +42,9 @@ Do not introduce a `+1` offset when refactoring this logic.
 
 ## Replacement ordering
 
-When the selected canonical problem differs from what is saved, execution creates and verifies the replacement before deleting the old memo. Deletes use Firestore `updateTime` preconditions. A raw memo backup is written before mutation.
+When the selected canonical position is unchanged but its accepted solution set changes, execution performs an in-place `UPDATE` of `:solutions` plus `:updated-at`, guarded by the memo's Firestore `updateTime`. Memo ID, due date, level, variation, upload date, and other training fields are preserved.
+
+When the selected canonical position changes, execution creates and verifies the replacement before deleting the old memo. Deletes use Firestore `updateTime` preconditions. A raw memo backup is written before any mutation. All CREATE/UPDATE verification completes before any superseded memo is deleted.
 
 ## Memo backup restore
 
@@ -59,6 +67,8 @@ The OGS importer fingerprints the board record using board dimensions, sorted se
 Unique fingerprints with at least eight moves are treated as local duplicates. Short games and fingerprint collisions require stricter player/title agreement; otherwise AI Sensei's duplicate dialog remains the fallback authority. The automation never chooses "Reupload game".
 
 Boards with either dimension below 7 are skipped before upload.
+
+After merging games from every requested OGS account, import planning sorts globally by `ended` ascending and game ID ascending. This means old games are uploaded first. `--max-ogs-games` is applied after the oldest-first sort. Already imported AI Sensei games are not reordered; this rule only controls new import planning.
 
 ## GoQuest status
 

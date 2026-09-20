@@ -82,14 +82,19 @@ import { createRequire } from 'node:module';
 import { chromium } from 'playwright';
 import { invokedScriptPath } from './cli/commands.mjs';
 import {
-  MIN_POINT_LOSS,
-  MIN_WR_DROP,
+  AI_SENSEI_STUDENT_LEVELS,
   TOP_POINT_LOSS_CANDIDATES,
   analysisTransitionForMove,
-  chooseCanonicalFromTop3,
+  chooseCanonicalFromQuiz,
+  chooseWorstOwnMove,
   directProblemColorAtMove,
-  qualifiesPracticeFloor,
+  isBadQuizLabel,
+  isWinrateVetoLabel,
+  lossTeachingSolutions,
+  mergeRankGoodMoveSets,
+  normalizeStudentRank,
   selectTopDistinctByFirstSolutionMove,
+  studentRankIndex,
 } from './cleanup/policy.mjs';
 import {
   buildMemoRestorePlan,
@@ -104,6 +109,7 @@ import {
   summarizeOgsImportState,
   verifyOgsImportPlanState,
 } from './ogs/checkpoint.mjs';
+import { sortOgsGamesOldestFirst } from './ogs/order.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -119,9 +125,6 @@ const MEMO_RESTORE_PLAN_JSON = path.resolve('memo-restore-plan.json');
 const DELETE_BATCH_SIZE = 200;
 const CREATE_BATCH_SIZE = 100;
 const ANALYSIS_CONCURRENCY = 8;
-const DECISIVE = 0.90;
-const LIVE_GAME = 0.10;
-const MATERIAL_WR_DROP = 0.10;
 const DEFAULT_PLAYER_NAMES = Object.freeze([]);
 
 const DEFAULT_OGS_ACCOUNTS = Object.freeze([]);
@@ -171,6 +174,7 @@ function die(message, code = 1) {
 function parseArgs(argv) {
   const out = {
     me: [...DEFAULT_PLAYER_NAMES],
+    removePlayers: [],
     execute: false,
     allowCreate: false,
     confirm: null,
@@ -203,6 +207,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--me') out.me.push(argv[++i] ?? '');
+    else if (a === '--remove-player') out.removePlayers.push(argv[++i] ?? '');
     else if (a === '--execute') out.execute = true;
     else if (a === '--allow-create') out.allowCreate = true;
     else if (a === '--confirm') out.confirm = argv[++i] ?? null;
@@ -236,6 +241,8 @@ Auto AI Sensei
 
 Optional:
   --me NAME              Identify one of your player names/handles. Repeat as needed.
+  --remove-player NAME   Mark games containing this exact player name for removal. Repeat as needed.
+                         These games are never eligible for saved practice problems.
   --execute              Apply the reviewed plan. Without this, dry-run only.
   --allow-create         Required with --execute when the plan contains CREATE rows.
   --confirm HASH         Required with --execute. Use the hash printed by dry-run.
@@ -300,6 +307,12 @@ Examples:
   }
 
   out.me = [...new Set(out.me.map(s => s.trim()).filter(Boolean))];
+  out.removePlayers = [...new Set(out.removePlayers.map(s => s.trim()).filter(Boolean))];
+  const myNames = new Set(out.me.map(normalizeName));
+  const overlappingRemovedNames = out.removePlayers.filter(name => myNames.has(normalizeName(name)));
+  if (overlappingRemovedNames.length) {
+    die(`--remove-player must not also be one of your --me aliases: ${overlappingRemovedNames.join(', ')}`);
+  }
   if (out.maxGames !== null && (!Number.isFinite(out.maxGames) || out.maxGames <= 0)) {
     die('--max-games must be a positive number.');
   }
@@ -392,6 +405,7 @@ function replayCliArgs(args) {
   for (const name of args.me) {
     if (!defaults.has(normalizeName(name))) parts.push('--me', shellQuote(name));
   }
+  for (const name of args.removePlayers) parts.push('--remove-player', shellQuote(name));
   if (Number.isFinite(args.maxGames)) parts.push('--max-games', String(args.maxGames));
   if (path.resolve(args.profileDir) !== PROFILE_DIR) parts.push('--profile-dir', shellQuote(args.profileDir));
   if (args.cdpUrl) parts.push('--cdp', shellQuote(args.cdpUrl));
@@ -873,6 +887,70 @@ function playerColorFromGameName(gameName, myNames) {
     whiteLabel,
     blackLabel,
   };
+}
+
+function rankFromPlayerLabel(label) {
+  const m = String(label ?? '').normalize('NFKC').trim().match(/(?:^|\s|\(|\[)(\d{1,2}\s*(?:k|q|kyu|d|dan|dm|p|pro))\s*(?:\)|\])?\s*$/i);
+  return m ? normalizeStudentRank(m[1]) : null;
+}
+
+function gameTimeRank(game, myColor) {
+  const info = game?.raw?.[':sgf-info'];
+  const direct = normalizeStudentRank(myColor === 'black' ? info?.[':br'] : info?.[':wr']);
+  if (direct) return { rank: direct, source: 'GAME_SGF_RANK' };
+  const parts = String(game?.name ?? '').split(/\s+vs\s+/i);
+  if (parts.length === 2) {
+    const label = myColor === 'white' ? parts[0] : parts[1];
+    const fromTitle = rankFromPlayerLabel(label);
+    if (fromTitle) return { rank: fromTitle, source: 'GAME_TITLE_RANK' };
+  }
+  return { rank: null, source: null };
+}
+
+function gameResultClass(game, myColor) {
+  const info = game?.raw?.[':sgf-info'];
+  const winnerRaw = String(game?.raw?.[':winner'] ?? info?.[':winner'] ?? '').trim().toLowerCase();
+  if (winnerRaw) {
+    if (/^(b|black)$/.test(winnerRaw)) return myColor === 'black' ? 'win' : 'loss';
+    if (/^(w|white)$/.test(winnerRaw)) return myColor === 'white' ? 'win' : 'loss';
+  }
+  const raw = String(
+    info?.[':result'] ?? info?.[':re'] ?? game?.raw?.[':result'] ?? game?.raw?.[':outcome'] ?? ''
+  ).normalize('NFKC').trim();
+  if (!raw) return 'unknown';
+  if (/^(0|draw|jigo|tie|void|no result)/i.test(raw)) return 'draw';
+  const m = raw.match(/^\s*([BW])\s*\+/i);
+  if (!m) return 'unknown';
+  const winner = m[1].toUpperCase() === 'B' ? 'black' : 'white';
+  return winner === myColor ? 'win' : 'loss';
+}
+
+function ogsRankFromPlayerRow(row) {
+  const direct = normalizeStudentRank(row?.rank ?? row?.rank_string ?? row?.rankString);
+  if (direct) return direct;
+  const ranking = Number(row?.ranking);
+  if (!Number.isInteger(ranking) || ranking < 0) return null;
+  if (ranking <= 29) return `${30 - ranking}k`;
+  const dan = ranking - 29;
+  return dan >= 1 && dan <= 9 ? `${dan}d` : null;
+}
+
+function exactPlayersFromGameName(gameName) {
+  const parts = String(gameName).split(/\s+vs\s+/i);
+  if (parts.length !== 2) return [];
+  return parts.map(stripTrailingRank).filter(Boolean);
+}
+
+function matchingRemovedPlayers(gameName, removePlayers) {
+  if (!removePlayers?.length) return [];
+  const players = new Set(exactPlayersFromGameName(gameName));
+  return removePlayers.filter(name => players.has(normalizeName(name)));
+}
+
+function shouldForceZeroProblemsForFatal(reason) {
+  return reason === 'PLAYER_NAME_AMBIGUOUS_OR_NOT_FOUND' ||
+    reason === 'UPLOAD_SGF_INFO_MISSING_PLAYERS' ||
+    reason === 'REMOVABLE_FOREIGN_PLAYER';
 }
 
 function inferAlternatingColorMap(game, gameNodes) {
@@ -1609,83 +1687,389 @@ function evaluateCandidate(uniqueMove, analysis, gameNodeMap, myColor) {
   };
 }
 
-function consequence(candidate) {
-  const before = candidate.myWinrateBefore;
-  const after = candidate.myWinrateAfter;
-  const drop = candidate.winrateDrop;
-
-  if (before >= 0.50 && after < 0.50) {
-    return { tier: 4, label: 'WINNING_TO_LOSING' };
+function uiRankFromText(text) {
+  const matches = String(text ?? '').match(/\b\d{1,2}\s*(?:kyu|dan|pro|dm|k|q|d|p)\b/ig) ?? [];
+  for (const match of matches) {
+    const rank = normalizeStudentRank(match);
+    if (rank) return rank;
   }
-  if (before >= DECISIVE && after < DECISIVE) {
-    return { tier: 3, label: 'THREW_AWAY_DECISIVE_LEAD' };
-  }
-  if (
-    drop >= MATERIAL_WR_DROP &&
-    ((before > LIVE_GAME && before < DECISIVE) || (after > LIVE_GAME && after < DECISIVE))
-  ) {
-    return { tier: 2, label: 'MEANINGFUL_WINRATE_LOSS' };
-  }
-  if (!((before >= DECISIVE && after >= DECISIVE) || (before <= LIVE_GAME && after <= LIVE_GAME))) {
-    return { tier: 1, label: 'COMPETITIVE_POSITION' };
-  }
-  return { tier: 0, label: 'ALREADY_DECIDED' };
+  return null;
 }
 
-function chooseKeeperFromDistinctSolutions(evaluatedMoves) {
-  // AI Sensei's "Avoid same move" means the saved SOLUTION is the same on
-  // different turns, not that the problem came from the same move number.
-  const bySolution = groupBy(evaluatedMoves, x => x.solutionKey);
-  const solutionCandidates = [];
+function quizProblemCountFromText(text) {
+  const m = String(text ?? '').match(/There\s+will\s+be\s+(\d+)\s+problems?\s+in\s+this\s+quiz/i);
+  return m ? Number(m[1]) : null;
+}
 
-  for (const [solutionKey, moves] of bySolution.entries()) {
-    if (!solutionKey) {
-      return { keeper: null, top3: [], ranked: [], error: 'MISSING_PRIMARY_SOLUTION' };
+function classificationFromText(text) {
+  const m = String(text ?? '').match(/\b(Good move|Inaccuracy|Mistake|Blunder)\b/i);
+  return m ? m[1].toLowerCase().replace(/\s+/g, ' ') : null;
+}
+
+async function nearestControlContainer(labelLocator, { minButtons = 0, maxDepth = 6 } = {}) {
+  let row = labelLocator;
+  for (let depth = 0; depth <= maxDepth; depth++) {
+    const buttons = row.locator('button,[role="button"]');
+    const count = await buttons.count().catch(() => 0);
+    const text = await row.innerText().catch(() => '');
+    if ((minButtons === 0 || count >= minButtons) && text.length < 1200) return row;
+    row = row.locator('xpath=..');
+  }
+  return row;
+}
+
+class AiSenseiQuizReader {
+  constructor(auth, uid) {
+    this.auth = auth;
+    this.uid = uid;
+    this.page = null;
+    this.gameId = null;
+  }
+
+  async ensurePage() {
+    if (this.page && !this.page.isClosed()) return this.page;
+    await ensureUploadBrowserSession(this.auth);
+    this.page = await this.auth.context.newPage();
+    this.auth.curationPage = this.page;
+    return this.page;
+  }
+
+  async openGame(gameId) {
+    const page = await this.ensurePage();
+    if (this.gameId !== gameId || !page.url().includes(`/game/${this.uid}/${gameId}`)) {
+      await page.goto(`https://ai-sensei.com/game/${encodeURIComponent(this.uid)}/${encodeURIComponent(gameId)}`, { waitUntil: 'domcontentloaded' });
+      await page.getByText('Student level', { exact: true }).first().waitFor({ state: 'visible', timeout: 30_000 });
+      this.gameId = gameId;
+      await sleep(250);
     }
-    const representative = [...moves].sort((a, b) => {
-      if (b.pointLoss !== a.pointLoss) return b.pointLoss - a.pointLoss;
-      const bWr = Number.isFinite(b.winrateDrop) ? b.winrateDrop : -1;
-      const aWr = Number.isFinite(a.winrateDrop) ? a.winrateDrop : -1;
-      if (bWr !== aWr) return bWr - aWr;
-      return a.moveNumber - b.moveNumber;
-    })[0];
-    solutionCandidates.push({
-      ...representative,
-      repeatedSolutionMoveNumbers: moves.map(x => x.moveNumber).sort((a, b) => a - b),
+    return page;
+  }
+
+  async studentLevelRow(root = null) {
+    const scope = root ?? await this.ensurePage();
+    const label = scope.getByText('Student level', { exact: true }).first();
+    await label.waitFor({ state: 'visible', timeout: 10_000 });
+    return nearestControlContainer(label, { minButtons: 2 });
+  }
+
+  async rankInRow(row) {
+    return uiRankFromText(await row.innerText());
+  }
+
+  async clickRankStep(row, direction) {
+    const literal = direction === 'stronger' ? '+' : '-';
+    let control = row.getByText(literal, { exact: true }).first();
+    if (!await control.isVisible().catch(() => false)) {
+      const buttons = row.locator('button,[role="button"]');
+      const count = await buttons.count();
+      if (!count) return false;
+      control = direction === 'stronger' ? buttons.nth(count - 1) : buttons.nth(0);
+    }
+    if (await control.isDisabled().catch(() => false)) return false;
+    const before = await this.rankInRow(row);
+    await control.click();
+    await sleep(100);
+    const after = await this.rankInRow(row);
+    return Boolean(after && after !== before);
+  }
+
+  async setRank(targetRank, root = null) {
+    const target = normalizeStudentRank(targetRank);
+    if (!target) throw new Error(`UNSUPPORTED_STUDENT_RANK:${targetRank}`);
+    const row = await this.studentLevelRow(root);
+    for (let attempt = 0; attempt < AI_SENSEI_STUDENT_LEVELS.length + 5; attempt++) {
+      const current = await this.rankInRow(row);
+      if (current === target) return current;
+      const ci = studentRankIndex(current);
+      const ti = studentRankIndex(target);
+      if (ci < 0 || ti < 0) throw new Error(`UNREADABLE_STUDENT_LEVEL:${current ?? 'unknown'}->${target}`);
+      const moved = await this.clickRankStep(row, ti > ci ? 'stronger' : 'weaker');
+      if (!moved) throw new Error(`STUDENT_LEVEL_BOUNDARY:${current}->${target}`);
+    }
+    throw new Error(`STUDENT_LEVEL_SET_TIMEOUT:${target}`);
+  }
+
+  async choiceRow(labelText, root = null) {
+    const scope = root ?? await this.ensurePage();
+    const label = scope.getByText(labelText, { exact: true }).first();
+    await label.waitFor({ state: 'visible', timeout: 10_000 });
+    return nearestControlContainer(label, { maxDepth: 5 });
+  }
+
+  async choose(labelText, choice, root = null) {
+    const row = await this.choiceRow(labelText, root);
+    const exact = row.getByText(choice, { exact: true }).first();
+    if (!await exact.isVisible().catch(() => false)) {
+      throw new Error(`UI_CHOICE_NOT_FOUND:${labelText}:${choice}`);
+    }
+    await exact.click();
+    await sleep(100);
+  }
+
+  async openQuizDialog() {
+    const page = await this.ensurePage();
+    await page.keyboard.press('Shift+Z').catch(() => {});
+    let heading = page.getByText('Start Quiz', { exact: true }).first();
+    if (!await heading.isVisible().catch(() => false)) {
+      const menu = page.getByText('Menu', { exact: true }).first();
+      if (await menu.isVisible().catch(() => false)) await menu.click();
+      const start = page.getByText('Start Quiz', { exact: true }).first();
+      await start.click();
+      heading = page.getByText('Start Quiz', { exact: true }).first();
+    }
+    await heading.waitFor({ state: 'visible', timeout: 10_000 });
+    const dialog = page.getByRole('dialog').filter({ hasText: 'Start Quiz' }).first();
+    if (await dialog.count()) return dialog;
+    return nearestControlContainer(heading, { maxDepth: 8 });
+  }
+
+  async closeQuizDialog(dialog) {
+    const cancel = dialog.getByText('Cancel', { exact: true }).first();
+    if (await cancel.isVisible().catch(() => false)) await cancel.click();
+    else await (await this.ensurePage()).keyboard.press('Escape');
+    await sleep(100);
+  }
+
+  async startQuizDialog(dialog, expectedCount) {
+    if (expectedCount === 0) {
+      await this.closeQuizDialog(dialog);
+      return false;
+    }
+    const ok = dialog.getByRole('button', { name: 'OK', exact: true }).first();
+    if (!await ok.isVisible().catch(() => false)) throw new Error('QUIZ_START_BUTTON_UNREADABLE');
+    await ok.click();
+    const page = await this.ensurePage();
+    await page.waitForFunction(count => {
+      const text = document.body?.innerText ?? '';
+      return new RegExp(`\\b1\\s*\\/\\s*${count}\\b`).test(text);
+    }, expectedCount, { timeout: 10_000 });
+    // Force the next openGame() to reload the normal game-analysis view after
+    // confirming that AI Sensei really started the configured Quiz.
+    this.gameId = null;
+    return true;
+  }
+
+  async chooseTemporaryQuizRank(normalRank, myColor) {
+    const dialog = await this.openQuizDialog();
+    try {
+      await this.setRank(normalRank, dialog);
+      await this.choose('Show only', myColor, dialog);
+      await this.choose('Sort by', 'point loss', dialog);
+      await this.choose('Avoid same move', 'on', dialog);
+      const row = await this.studentLevelRow(dialog);
+      let selected = null;
+      for (let attempt = 0; attempt < AI_SENSEI_STUDENT_LEVELS.length + 5; attempt++) {
+        const text = await dialog.innerText();
+        const count = quizProblemCountFromText(text);
+        const rank = await this.rankInRow(row);
+        if (!Number.isInteger(count)) throw new Error('QUIZ_PROBLEM_COUNT_UNREADABLE');
+        if (count >= TOP_POINT_LOSS_CANDIDATES) {
+          selected = { rank, problemCount: count, reachedThree: true };
+          break;
+        }
+        const moved = await this.clickRankStep(row, 'stronger');
+        if (!moved) {
+          selected = { rank, problemCount: count, reachedThree: false };
+          break;
+        }
+      }
+      if (!selected) throw new Error('QUIZ_RANK_ESCALATION_TIMEOUT');
+      const quizStarted = await this.startQuizDialog(dialog, selected.problemCount);
+      return { ...selected, quizStarted };
+    } catch (err) {
+      await this.closeQuizDialog(dialog).catch(() => {});
+      throw err;
+    }
+  }
+
+  async setScoreMode(mode) {
+    await this.choose('Display scores as', mode === 'winrate' ? 'win %' : 'points');
+  }
+
+  async readNextMovePanelText() {
+    const page = await this.ensurePage();
+    const label = page.getByText('Next game move', { exact: true }).first();
+    await label.waitFor({ state: 'visible', timeout: 10_000 });
+    let row = label;
+    let best = '';
+    for (let depth = 0; depth < 6; depth++) {
+      const text = await row.innerText().catch(() => '');
+      if (text.length > best.length && text.length < 1000) best = text;
+      if (classificationFromText(text) && /Next game move/i.test(text)) return text;
+      row = row.locator('xpath=..');
+    }
+    return best;
+  }
+
+  async readNextMoveNumber() {
+    const text = await this.readNextMovePanelText();
+    const m = text.match(/Next\s+game\s+move\s*\n?\s*(\d{1,4})\b/i);
+    return m ? Number(m[1]) : null;
+  }
+
+  async stepMove(direction) {
+    const page = await this.ensurePage();
+    const name = direction === 'next' ? /next\s+(?:game\s+)?move/i : /prev(?:ious)?\s+(?:game\s+)?move/i;
+    const locator = page.locator('[title],[aria-label]').filter({ has: page.locator(':scope') });
+    const candidates = page.locator(direction === 'next'
+      ? '[title*="next move" i],[aria-label*="next move" i],[title*="next game move" i],[aria-label*="next game move" i]'
+      : '[title*="prev move" i],[aria-label*="prev move" i],[title*="previous move" i],[aria-label*="previous move" i]');
+    if (await candidates.count()) {
+      const control = candidates.first();
+      if (await control.isVisible().catch(() => false)) {
+        await control.click();
+        await sleep(75);
+        return;
+      }
+    }
+    void locator; void name;
+    await page.locator('body').click({ position: { x: 2, y: 2 } }).catch(() => {});
+    await page.keyboard.press(direction === 'next' ? 'ArrowRight' : 'ArrowLeft');
+    await sleep(75);
+  }
+
+  async seekMove(moveNumber, gameLength) {
+    let current = await this.readNextMoveNumber().catch(() => null);
+    if (!Number.isInteger(current)) {
+      for (let i = 0; i < Math.min(gameLength + 2, 8) && !Number.isInteger(current); i++) {
+        await this.stepMove('prev');
+        current = await this.readNextMoveNumber().catch(() => null);
+      }
+    }
+    if (!Number.isInteger(current)) throw new Error(`MOVE_NAVIGATION_UNREADABLE@${moveNumber}`);
+    for (let i = 0; i < gameLength + 4 && current !== moveNumber; i++) {
+      const before = current;
+      await this.stepMove(current < moveNumber ? 'next' : 'prev');
+      current = await this.readNextMoveNumber().catch(() => null);
+      if (!Number.isInteger(current)) throw new Error(`MOVE_NAVIGATION_LOST@${moveNumber}`);
+      if (current === before) throw new Error(`MOVE_NAVIGATION_STUCK@${moveNumber}`);
+    }
+    if (current !== moveNumber) throw new Error(`MOVE_NAVIGATION_TIMEOUT@${moveNumber}`);
+  }
+
+  async classifyMove(moveNumber, { rank, mode, gameLength }) {
+    await this.setRank(rank);
+    await this.setScoreMode(mode);
+    await this.seekMove(moveNumber, gameLength);
+    const text = await this.readNextMovePanelText();
+    const label = classificationFromText(text);
+    if (!label) throw new Error(`MOVE_CLASSIFICATION_UNREADABLE@${moveNumber}:${mode}`);
+    return { label, bad: isBadQuizLabel(label) };
+  }
+
+  async classifyMoves(moveNumbers, { rank, mode, gameLength }) {
+    await this.setRank(rank);
+    await this.setScoreMode(mode);
+    const out = new Map();
+    for (const moveNumber of [...new Set(moveNumbers)].sort((a, b) => a - b)) {
+      await this.seekMove(moveNumber, gameLength);
+      const label = classificationFromText(await this.readNextMovePanelText());
+      if (!label) throw new Error(`MOVE_CLASSIFICATION_UNREADABLE@${moveNumber}:${mode}`);
+      out.set(moveNumber, { label, bad: isBadQuizLabel(label) });
+    }
+    return out;
+  }
+
+  async enableSuggestionOverlay() {
+    await this.choose('Show move suggestions', 'always');
+    await this.choose('AI Suggestions as', 'both').catch(async () => {
+      await this.choose('AI Suggestions as', 'letters');
     });
   }
 
-  const top3Raw = solutionCandidates
-    .sort((a, b) => b.pointLoss - a.pointLoss)
-    .slice(0, TOP_POINT_LOSS_CANDIDATES);
-
-  if (top3Raw.length === 1) {
-    const only = {
-      ...top3Raw[0],
-      consequence: { tier: null, label: 'ONLY_UNIQUE_SOLUTION' },
-    };
-    return { keeper: only, top3: [only], ranked: [only], solutionCandidates };
+  async domMovesMatchingFingerprint(boardSize, markerSource) {
+    const page = await this.ensurePage();
+    const raw = await page.locator('body *').evaluateAll((elements, source) => {
+      const marker = new RegExp(source, 'i');
+      const out = [];
+      for (const el of elements) {
+        const rect = el.getBoundingClientRect();
+        if (!rect.width || !rect.height) continue;
+        const attrs = {};
+        for (const name of ['class', 'title', 'aria-label', 'data-coordinate', 'data-coord', 'data-move', 'data-point', 'data-vertex']) {
+          const v = el.getAttribute?.(name);
+          if (v) attrs[name] = v;
+        }
+        const text = String(el.textContent ?? '').trim().slice(0, 80);
+        const fingerprint = `${Object.values(attrs).join(' ')} ${text}`;
+        if (!marker.test(fingerprint)) continue;
+        out.push({ attrs, text });
+      }
+      return out;
+    }, markerSource);
+    const moves = new Set();
+    for (const item of raw) {
+      const direct = item.attrs['data-coordinate'] ?? item.attrs['data-coord'] ?? item.attrs['data-move'] ?? item.attrs['data-point'] ?? item.attrs['data-vertex'];
+      const values = [direct, item.attrs.title, item.attrs['aria-label'], item.text].filter(Boolean);
+      for (const value of values) {
+        const text = String(value).trim();
+        if (/^[a-z]{2}$/i.test(text)) {
+          const move = sgfCoordFromGtp(text, boardSize);
+          if (move) moves.add(move);
+        }
+        for (const match of text.matchAll(/\b([A-HJ-T](?:1\d|[1-9]))\b/gi)) {
+          const move = sgfCoordFromGtp(match[1], boardSize);
+          if (move) moves.add(move);
+        }
+      }
+    }
+    return [...moves].sort();
   }
 
-  const missingWr = top3Raw.find(x => !Number.isFinite(x.winrateDrop));
-  if (missingWr) {
+  async domSuggestionMoves(boardSize) {
+    return this.domMovesMatchingFingerprint(boardSize, '(good|best|suggest|policy|candidate|hint|recommend)');
+  }
+
+  async domWinrateVetoMoves(boardSize) {
+    return this.domMovesMatchingFingerprint(boardSize, '(mistake|blunder)');
+  }
+
+  async goodMovesAtPosition(moveNumber, { normalRank, bestMove, boardSize, gameLength }) {
+    await this.setRank(normalRank);
+    await this.enableSuggestionOverlay();
+    await this.seekMove(moveNumber, gameLength);
+    await this.setScoreMode('points');
+    await sleep(150);
+    const pointGoodMoves = await this.domSuggestionMoves(boardSize);
+    await this.setScoreMode('winrate');
+    await sleep(150);
+    const winrateGoodMoves = await this.domSuggestionMoves(boardSize);
+    const winrateBadMoves = await this.domWinrateVetoMoves(boardSize);
+    const winrateEvidence = new Set([...winrateGoodMoves, ...winrateBadMoves]);
+    const unresolvedPointMoves = pointGoodMoves.filter(move => !winrateEvidence.has(move));
+    if (!pointGoodMoves.length || unresolvedPointMoves.length) {
+      return {
+        ok: false,
+        reason: `GOOD_MOVE_OVERLAY_UNREADABLE:points=${pointGoodMoves.length}:winrate-good=${winrateGoodMoves.length}:winrate-bad=${winrateBadMoves.length}:unresolved=${unresolvedPointMoves.join('|')}`,
+        pointGoodMoves,
+        winrateGoodMoves,
+        winrateBadMoves,
+        solutionMoves: bestMove ? [bestMove] : [],
+      };
+    }
     return {
-      keeper: null,
-      top3: top3Raw,
-      ranked: [],
-      solutionCandidates,
-      error: `MISSING_WINRATE_FOR_TOP3@position${missingWr.moveNumber}`,
+      ok: true,
+      pointGoodMoves,
+      winrateGoodMoves,
+      winrateBadMoves,
+      solutionMoves: mergeRankGoodMoveSets({ pointGoodMoves, winrateBadMoves, bestMove }),
     };
   }
 
-  const top3 = top3Raw.map(x => ({ ...x, consequence: consequence(x) }));
-  const ranked = [...top3].sort((a, b) => {
-    if (b.consequence.tier !== a.consequence.tier) return b.consequence.tier - a.consequence.tier;
-    if (b.winrateDrop !== a.winrateDrop) return b.winrateDrop - a.winrateDrop;
-    return b.pointLoss - a.pointLoss;
-  });
-
-  return { keeper: ranked[0] ?? null, top3, ranked, solutionCandidates };
+  async aiRankPrediction(gameId) {
+    const page = await this.openGame(gameId);
+    const menu = page.getByText('Menu', { exact: true }).first();
+    if (await menu.isVisible().catch(() => false)) await menu.click();
+    const item = page.getByText('AI Rank Prediction', { exact: true }).first();
+    if (!await item.isVisible().catch(() => false)) return null;
+    await item.click();
+    await sleep(250);
+    const text = await page.locator('body').innerText();
+    const section = text.match(/AI Rank Prediction[\s\S]{0,500}/i)?.[0] ?? text;
+    const rank = uiRankFromText(section);
+    await page.keyboard.press('Escape').catch(() => {});
+    return rank;
+  }
 }
 
 async function captureAuth(args) {
@@ -1765,7 +2149,7 @@ async function captureAuth(args) {
   }
 
   const authState = {
-    browser, context, page, uploadPage: null, uid, externalBrowser,
+    browser, context, page, uploadPage: null, curationPage: null, uid, externalBrowser,
     get token() { return latestToken ?? initialToken; },
     async refreshToken() {
       const oldToken = latestToken ?? initialToken;
@@ -1913,7 +2297,7 @@ class FirestoreClient {
     const due = initialDueDate(now);
     const writes = [];
     for (const c of creates) {
-      if (!c.memoId || !c.gameId || !Number.isInteger(c.moveNumber) || !c.solutionMove) {
+      if (!c.memoId || !c.gameId || !Number.isInteger(c.moveNumber) || !c.solutionMoves?.length) {
         throw new Error(`Invalid CREATE plan row for ${c.gameId ?? '?'} move ${c.moveNumber ?? '?'}`);
       }
       const memoName = `${FIRESTORE_ROOT}/:users/${uid}/:memos/${c.memoId}`;
@@ -1925,7 +2309,7 @@ class FirestoreClient {
             ':game-uid': { stringValue: uid },
             ':game-id': { stringValue: c.gameId },
             ':move-number': { integerValue: String(c.moveNumber) },
-            ':solutions': firestoreSolutionsForFirstMove(c.solutionMove),
+            ':solutions': firestoreSolutionsForFirstMoves(c.solutionMoves),
             ':due-date': { timestampValue: due },
           },
         },
@@ -1936,6 +2320,28 @@ class FirestoreClient {
         writes.push({ verify: c.gameDocName, currentDocument: { updateTime: c.gameUpdateTime } });
       }
     }
+    return this.post(url, { writes });
+  }
+
+  async commitSolutionUpdates(updates) {
+    if (!updates.length) return null;
+    const url = `${FIRESTORE_BASE}:commit`;
+    const writes = updates.map(u => {
+      if (!u.docName || !u.updateTime || !u.solutionMoves?.length) {
+        throw new Error(`Invalid UPDATE plan row for ${u.gameId ?? '?'} move ${u.moveNumber ?? '?'}`);
+      }
+      return {
+        update: {
+          name: u.docName,
+          fields: {
+            ':solutions': firestoreSolutionsForFirstMoves(u.solutionMoves),
+          },
+        },
+        updateMask: { fieldPaths: ['`:solutions`'] },
+        updateTransforms: [{ fieldPath: '`:updated-at`', setToServerValue: 'REQUEST_TIME' }],
+        currentDocument: { updateTime: u.updateTime },
+      };
+    });
     return this.post(url, { writes });
   }
 
@@ -2002,27 +2408,37 @@ function csvEscape(v) {
 function planToCsv(rows) {
   const cols = [
     'gameId', 'gameName', 'myColor', 'memoId', 'moveNumber', 'problemColor', 'problemColorSource',
-    'solutionKey', 'solutionMove', 'solutionSource', 'pointLoss', 'myWinrateBefore', 'myWinrateAfter', 'winrateDrop',
-    'qualifiesFloor', 'top3DistinctSolution', 'action', 'reason', 'keeperMemoId', 'analysisStatus', 'gameUpdateTime',
+    'solutionKey', 'solutionMove', 'solutionMoves', 'solutionSource', 'pointLoss', 'myWinrateBefore', 'myWinrateAfter', 'winrateDrop',
+    'normalRank', 'normalRankSource', 'temporaryRank', 'temporaryQuizProblemCount', 'resultClass',
+    'normalPointLabel', 'normalWinrateLabel', 'solutionSyncStatus', 'retryStatus',
+    'top3DistinctSolution', 'action', 'reason', 'keeperMemoId', 'analysisStatus', 'updateTime', 'gameUpdateTime',
   ];
   const lines = [cols.join(',')];
   for (const r of rows) lines.push(cols.map(c => csvEscape(r[c])).join(','));
   return lines.join('\n') + '\n';
 }
 
-function stablePlanHash(rows) {
-  const minimal = rows.map(r => ({
+function stablePlanHash(rows, gameRemovalTargets = []) {
+  const minimalRows = rows.map(r => ({
     gameId: r.gameId,
     memoId: r.memoId || null,
     moveNumber: r.moveNumber === '' ? null : r.moveNumber,
     action: r.action,
     reason: r.reason,
     solutionMove: r.solutionMove || null,
+    solutionMoves: canonicalMoveSet(String(r.solutionMoves ?? '').split('|')).join('|') || null,
     keeperMemoId: r.keeperMemoId || null,
     updateTime: r.updateTime || null,
     gameUpdateTime: r.gameUpdateTime || null,
   })).sort((a, b) => `${a.gameId}/${a.memoId ?? ''}/${a.action}`.localeCompare(`${b.gameId}/${b.memoId ?? ''}/${b.action}`));
-  return crypto.createHash('sha256').update(JSON.stringify(minimal)).digest('hex').slice(0, 12);
+  const minimalGameRemovals = gameRemovalTargets.map(g => ({
+    gameId: g.gameId,
+    matchedPlayers: [...(g.matchedPlayers ?? [])].map(normalizeName).sort(),
+  })).sort((a, b) => a.gameId.localeCompare(b.gameId));
+  return crypto.createHash('sha256')
+    .update(JSON.stringify({ rows: minimalRows, gameRemovals: minimalGameRemovals }))
+    .digest('hex')
+    .slice(0, 12);
 }
 
 function normalizedKeyName(k) {
@@ -3220,7 +3636,11 @@ class OgsClient {
     if (exact.length !== 1) {
       throw new Error(`Could not resolve OGS username ${JSON.stringify(username)} exactly (matches=${exact.length}).`);
     }
-    return { id: Number(exact[0].id), username: String(exact[0].username) };
+    return {
+      id: Number(exact[0].id),
+      username: String(exact[0].username),
+      rank: ogsRankFromPlayerRow(exact[0]),
+    };
   }
 
   async completedGames(player) {
@@ -3343,11 +3763,7 @@ async function buildOgsImportPlan(args) {
     }
   }
 
-  let games = [...byGame.values()].sort((a, b) => {
-    const at = Date.parse(a.ended) || 0;
-    const bt = Date.parse(b.ended) || 0;
-    return bt - at || b.id - a.id;
-  });
+  let games = sortOgsGamesOldestFirst([...byGame.values()]);
   const totalUnique = games.length;
   if (Number.isFinite(args.maxOgsGames)) games = games.slice(0, args.maxOgsGames);
 
@@ -4109,11 +4525,13 @@ function firestoreSolutionString(move) {
   return move === '<pass>' ? '' : move;
 }
 
-function firestoreSolutionsForFirstMove(move) {
+function firestoreSolutionsForFirstMoves(moves) {
+  const unique = [...new Set((moves ?? []).map(normalizeSolutionMove).filter(Boolean))].sort();
+  if (!unique.length) throw new Error('Cannot encode an empty solution set.');
   return {
     mapValue: {
       fields: {
-        '0': { arrayValue: { values: [{ stringValue: firestoreSolutionString(move) }] } },
+        '0': { arrayValue: { values: unique.map(move => ({ stringValue: firestoreSolutionString(move) })) } },
       },
     },
   };
@@ -4134,6 +4552,21 @@ function describeMetric(candidate) {
   };
 }
 
+function canonicalMoveSet(moves) {
+  return [...new Set((moves ?? []).map(normalizeSolutionMove).filter(Boolean))].sort();
+}
+
+function sameMoveSet(a, b) {
+  const aa = canonicalMoveSet(a);
+  const bb = canonicalMoveSet(b);
+  return aa.length === bb.length && aa.every((move, i) => move === bb[i]);
+}
+
+function solutionKeyForMoves(moves) {
+  const canonical = canonicalMoveSet(moves);
+  return canonical.length ? `first=${canonical.join('|')}` : null;
+}
+
 function makeBaseRow(g, m = null) {
   return {
     gameId: g.gameId,
@@ -4144,10 +4577,13 @@ function makeBaseRow(g, m = null) {
     problemColor: m?.problemColor ?? '',
     problemColorSource: m?.problemColorSource ?? '',
     solutionKey: m?.solutionKey ?? '',
-    solutionMove: '',
+    solutionMove: '', solutionMoves: '',
     solutionSource: '',
     pointLoss: '', myWinrateBefore: '', myWinrateAfter: '', winrateDrop: '',
-    qualifiesFloor: '', top3DistinctSolution: '', action: '', reason: '', keeperMemoId: '',
+    top3DistinctSolution: '', action: '', reason: '', keeperMemoId: '',
+    normalRank: g.normalRank ?? '', normalRankSource: g.normalRankSource ?? '', temporaryRank: g.temporaryRank ?? '',
+    temporaryQuizProblemCount: g.temporaryQuizProblemCount ?? '', resultClass: g.resultClass ?? '',
+    normalPointLabel: '', normalWinrateLabel: '', solutionSyncStatus: g.solutionStatus ?? '', retryStatus: '',
     analysisStatus: '', updateTime: m?.updateTime ?? '', gameUpdateTime: g.game?.updateTime ?? '',
   };
 }
@@ -4170,7 +4606,208 @@ function analyzeSavedSolutionValidation(gameMemos, solutionIndex, gameLength) {
   return { checked, matched, mismatched, unavailable, mismatches };
 }
 
-async function buildPlan(fsClient, uid, args) {
+async function currentOgsRankForAliases(aliases) {
+  const client = new OgsClient({ requestDelayMs: Math.max(500, OGS_LOCAL_DELAY_MS) });
+  for (const alias of aliases ?? []) {
+    try {
+      const player = await client.resolvePlayer(alias);
+      if (player.rank) return { rank: player.rank, source: `CURRENT_OGS_RANK:${player.username}` };
+    } catch {
+      // A cleanup alias does not have to be an OGS account. Try the next alias.
+    }
+  }
+  return { rank: null, source: null };
+}
+
+async function resolveNormalStudentRank(g, quizReader, args, currentRankResolver) {
+  const historical = gameTimeRank(g.game, g.myColor);
+  if (historical.rank) return historical;
+  try {
+    const predicted = normalizeStudentRank(await quizReader.aiRankPrediction(g.gameId));
+    if (predicted) return { rank: predicted, source: 'AI_RANK_PREDICTION' };
+  } catch (err) {
+    if (args.verbose) console.warn(`  ${g.gameId}: AI Rank Prediction unavailable: ${err.message}`);
+  }
+  const current = await currentRankResolver();
+  if (current.rank) return current;
+  return { rank: '10k', source: 'DEFAULT_10K' };
+}
+
+async function curateGameFromQuiz(g, quizReader, normalRankInfo) {
+  await quizReader.openGame(g.gameId);
+  const normalRank = normalRankInfo.rank;
+  const resultClass = gameResultClass(g.game, g.myColor);
+  const temporary = await quizReader.chooseTemporaryQuizRank(normalRank, g.myColor);
+  if (temporary.quizStarted) await quizReader.openGame(g.gameId);
+  const allCandidates = g.rawCandidates ?? [];
+  const moveNumbers = allCandidates.map(x => x.moveNumber);
+  const tempPoint = await quizReader.classifyMoves(moveNumbers, {
+    rank: temporary.rank,
+    mode: 'points',
+    gameLength: g.game.moves.length,
+  });
+
+  const quizBad = allCandidates.filter(c => tempPoint.get(c.moveNumber)?.bad === true);
+  let distinct = selectTopDistinctByFirstSolutionMove(quizBad);
+  if (distinct.error) throw new Error(distinct.error);
+  const expectedQuizCandidates = Math.min(TOP_POINT_LOSS_CANDIDATES, temporary.problemCount);
+  if (distinct.top.length < expectedQuizCandidates ||
+      (temporary.problemCount < TOP_POINT_LOSS_CANDIDATES && distinct.top.length !== expectedQuizCandidates)) {
+    throw new Error(`QUIZ_CANDIDATE_RECONCILIATION_FAILED:expected=${expectedQuizCandidates}:found=${distinct.top.length}`);
+  }
+  let top3 = distinct.top.slice(0, expectedQuizCandidates);
+  let lossZeroQuizFallback = false;
+
+  if (!top3.length && resultClass === 'loss') {
+    const fallback = chooseWorstOwnMove(allCandidates.filter(candidate => candidate.solutionMove));
+    top3 = fallback.keeper ? [fallback.keeper] : [];
+    lossZeroQuizFallback = Boolean(fallback.keeper);
+  }
+
+  if (!top3.length) {
+    return {
+      normalRank,
+      normalRankSource: normalRankInfo.source,
+      temporaryRank: temporary.rank,
+      temporaryQuizProblemCount: temporary.problemCount,
+      resultClass,
+      top3: [],
+      selection: { keeper: null, eligible: [], ranked: [] },
+      solutionStatus: 'NOT_NEEDED',
+      lossZeroQuizFallback,
+    };
+  }
+
+  const topMoves = top3.map(x => x.moveNumber);
+  const normalPoint = await quizReader.classifyMoves(topMoves, {
+    rank: normalRank,
+    mode: 'points',
+    gameLength: g.game.moves.length,
+  });
+  const normalWinrate = await quizReader.classifyMoves(topMoves, {
+    rank: normalRank,
+    mode: 'winrate',
+    gameLength: g.game.moves.length,
+  });
+  top3 = top3.map(candidate => ({
+    ...candidate,
+    normalPointLabel: normalPoint.get(candidate.moveNumber)?.label ?? null,
+    normalWinrateLabel: normalWinrate.get(candidate.moveNumber)?.label ?? null,
+    normalBadByPoint: normalPoint.get(candidate.moveNumber)?.bad === true,
+    // Win-rate mode is stricter by design: an Inaccuracy alone is not a
+    // win-rate veto. Only AI Sensei's Mistake/Blunder labels count here.
+    normalBadByWinrate: isWinrateVetoLabel(normalWinrate.get(candidate.moveNumber)?.label),
+  }));
+
+  const selection = chooseCanonicalFromQuiz(top3, { resultClass });
+  if (!selection.keeper) {
+    return {
+      normalRank,
+      normalRankSource: normalRankInfo.source,
+      temporaryRank: temporary.rank,
+      temporaryQuizProblemCount: temporary.problemCount,
+      resultClass,
+      top3,
+      selection,
+      solutionStatus: 'NOT_NEEDED',
+      lossZeroQuizFallback,
+    };
+  }
+
+  let playedBestFallback = null;
+  for (const candidate of selection.ranked) {
+    const bestMove = candidate.solutionMove;
+    const sync = await quizReader.goodMovesAtPosition(candidate.moveNumber, {
+      normalRank,
+      bestMove,
+      boardSize: g.game.boardSize ?? 19,
+      gameLength: g.game.moves.length,
+    });
+    if (!sync.ok) {
+      return {
+        normalRank,
+        normalRankSource: normalRankInfo.source,
+        temporaryRank: temporary.rank,
+        temporaryQuizProblemCount: temporary.problemCount,
+        resultClass,
+        top3,
+        selection: { ...selection, keeper: candidate },
+        solutionMoves: bestMove ? [bestMove] : [],
+        solutionStatus: 'RETRY_SOLUTION_SYNC',
+        solutionError: sync.reason,
+        lossZeroQuizFallback,
+      };
+    }
+
+    let solutionMoves = sync.solutionMoves;
+    let teaching = null;
+    if (resultClass === 'loss') {
+      const playedMove = normalizeSolutionMove(g.game.moves[candidate.moveNumber - 1]);
+      teaching = lossTeachingSolutions(solutionMoves, { playedMove, bestMove });
+      solutionMoves = teaching.solutionMoves;
+      if (!solutionMoves.length) {
+        const fallback = lossTeachingSolutions(sync.solutionMoves, {
+          playedMove,
+          bestMove,
+          allowPlayedBestFallback: true,
+        });
+        if (fallback.fallbackPlayedBest) playedBestFallback ??= { candidate, sync, fallback };
+        continue;
+      }
+    }
+    return {
+      normalRank,
+      normalRankSource: normalRankInfo.source,
+      temporaryRank: temporary.rank,
+      temporaryQuizProblemCount: temporary.problemCount,
+      resultClass,
+      top3,
+      selection: { ...selection, keeper: candidate },
+      solutionMoves,
+      pointGoodMoves: sync.pointGoodMoves,
+      winrateGoodMoves: sync.winrateGoodMoves,
+      winrateBadMoves: sync.winrateBadMoves,
+      solutionStatus: 'SYNCED',
+      playedMoveExcluded: teaching?.playedMoveExcluded ?? false,
+      lossZeroQuizFallback,
+    };
+  }
+
+  if (resultClass === 'loss' && playedBestFallback) {
+    const { candidate, sync, fallback } = playedBestFallback;
+    return {
+      normalRank,
+      normalRankSource: normalRankInfo.source,
+      temporaryRank: temporary.rank,
+      temporaryQuizProblemCount: temporary.problemCount,
+      resultClass,
+      top3,
+      selection: { ...selection, keeper: candidate },
+      solutionMoves: fallback.solutionMoves,
+      pointGoodMoves: sync.pointGoodMoves,
+      winrateGoodMoves: sync.winrateGoodMoves,
+      winrateBadMoves: sync.winrateBadMoves,
+      solutionStatus: 'SYNCED_PLAYED_BEST_FALLBACK',
+      playedMoveExcluded: false,
+      lossZeroQuizFallback,
+    };
+  }
+
+  return {
+    normalRank,
+    normalRankSource: normalRankInfo.source,
+    temporaryRank: temporary.rank,
+    temporaryQuizProblemCount: temporary.problemCount,
+    resultClass,
+    top3,
+    selection: { ...selection, keeper: null },
+    solutionMoves: [],
+    solutionStatus: 'NO_TEACHING_ALTERNATIVE',
+    lossZeroQuizFallback,
+  };
+}
+
+async function buildPlan(fsClient, uid, args, quizReader) {
   console.log('Fetching full problem library...');
   const memoDocs = await fsClient.allMemos(uid);
   const parsedMemos = memoDocs.map(parseMemo);
@@ -4199,6 +4836,7 @@ async function buildPlan(fsClient, uid, args) {
   ]);
 
   const prepared = [];
+  const gameRemovalTargets = [];
   let recoveredImportedGames = 0;
   for (const gameId of selectedIds) {
     const gameMemos = memoGroups.get(gameId) ?? [];
@@ -4215,6 +4853,19 @@ async function buildPlan(fsClient, uid, args) {
         prepared.push({ gameId, gameMemos, game, gameNodes, fatal: recovered.reason ?? 'MISSING_GAME_DOCUMENT' });
         continue;
       }
+    }
+    const matchedRemovedPlayers = matchingRemovedPlayers(game.name, args.removePlayers);
+    if (matchedRemovedPlayers.length) {
+      gameRemovalTargets.push({
+        gameId,
+        gameName: game.name,
+        matchedPlayers: matchedRemovedPlayers,
+      });
+      prepared.push({
+        gameId, gameMemos, game, gameNodes, myColor: null,
+        fatal: 'REMOVABLE_FOREIGN_PLAYER', matchedRemovedPlayers,
+      });
+      continue;
     }
     const who = playerColorFromGameName(game.name, args.me);
     if (!who.color) {
@@ -4307,19 +4958,8 @@ async function buildPlan(fsClient, uid, args) {
           pv: sol?.pv ?? null,
         };
       });
-      const distinct = selectTopDistinctByFirstSolutionMove(candidatesWithSolutions);
-      if (distinct.error) {
-        g.analysisError = distinct.error;
-        return;
-      }
-      const top3 = distinct.top;
-      if (!top3.length) {
-        g.analysisError = 'NO_DISTINCT_SOLUTION_CANDIDATES';
-        return;
-      }
       g.allMyMoves = mine;
-      g.top3 = top3;
-      g.selection = chooseCanonicalFromTop3(top3);
+      g.rawCandidates = candidatesWithSolutions;
     } catch (err) {
       g.analysisError = `ANALYSIS_QUERY_FAILED:${err.message}`;
     } finally {
@@ -4329,15 +4969,40 @@ async function buildPlan(fsClient, uid, args) {
   });
   if (toAnalyze.length) process.stdout.write('\n');
 
+  if (!quizReader) throw new Error('Authenticated AI Sensei browser session is required for rank-aware Quiz curation.');
+  let currentRankPromise = null;
+  const currentRankResolver = () => {
+    currentRankPromise ??= currentOgsRankForAliases(args.me);
+    return currentRankPromise;
+  };
+  const toCurate = toAnalyze.filter(g => !g.analysisError);
+  console.log(`Reading AI Sensei Quiz/rank behavior for ${toCurate.length} games...`);
+  let curatedCount = 0;
+  for (const g of toCurate) {
+    try {
+      const normalRankInfo = await resolveNormalStudentRank(g, quizReader, args, currentRankResolver);
+      const quiz = await curateGameFromQuiz(g, quizReader, normalRankInfo);
+      Object.assign(g, quiz);
+      g.top3 = quiz.top3;
+      g.selection = quiz.selection;
+    } catch (err) {
+      g.analysisError = `QUIZ_UI_FAILED:${err.message}`;
+    } finally {
+      curatedCount++;
+      process.stdout.write(`\rCurated games ${curatedCount}/${toCurate.length}`);
+    }
+  }
+  if (toCurate.length) process.stdout.write('\n');
+
   const rows = [];
   const deletionMemos = [];
   const createMemos = [];
+  const updateMemos = [];
   const skippedGames = [];
   const gameSummaries = [];
   const totals = {
     eligibleGames: 0, qualifyingGames: 0, existingProblemKeptGames: 0, replacementCreateGames: 0,
-    newCreateGames: 0, belowFloorGames: 0, skippedGames: 0,
-    staleCanonicalSolutionReplacementGames: 0,
+    newCreateGames: 0, noProblemGames: 0, skippedGames: 0, updatedSolutionGames: 0, retrySolutionSyncGames: 0,
     validationChecked: 0, validationMatched: 0, validationMismatched: 0, validationUnavailable: 0,
   };
 
@@ -4347,15 +5012,30 @@ async function buildPlan(fsClient, uid, args) {
     if (fatal) {
       totals.skippedGames++;
       skippedGames.push({ gameId: g.gameId, gameName, reason: fatal });
+      const forceZeroProblems = shouldForceZeroProblemsForFatal(fatal);
       if (g.gameMemos.length) {
         for (const m of g.gameMemos) {
           const row = makeBaseRow(g, m);
-          row.action = 'SKIP'; row.reason = fatal; row.analysisStatus = fatal;
+          if (forceZeroProblems) {
+            row.action = 'DELETE';
+            row.reason = fatal === 'REMOVABLE_FOREIGN_PLAYER'
+              ? 'REMOVABLE_PLAYER_GAME_ZERO_PROBLEMS'
+              : 'AMBIGUOUS_GAME_ZERO_PROBLEMS';
+            deletionMemos.push(m);
+          } else {
+            row.action = 'SKIP';
+            row.reason = fatal;
+          }
+          row.analysisStatus = fatal;
           rows.push(row);
         }
       } else {
         const row = makeBaseRow(g);
-        row.action = 'SKIP'; row.reason = fatal; row.analysisStatus = fatal;
+        row.action = forceZeroProblems ? 'NONE' : 'SKIP';
+        row.reason = forceZeroProblems
+          ? (fatal === 'REMOVABLE_FOREIGN_PLAYER' ? 'REMOVABLE_PLAYER_GAME_ZERO_PROBLEMS' : 'AMBIGUOUS_GAME_ZERO_PROBLEMS')
+          : fatal;
+        row.analysisStatus = fatal;
         rows.push(row);
       }
       gameSummaries.push({ gameId: g.gameId, gameName, myColor: g.myColor ?? null, reason: fatal });
@@ -4373,47 +5053,77 @@ async function buildPlan(fsClient, uid, args) {
     const selected = g.selection?.keeper ?? null;
     const top3Moves = new Set(top3.map(x => x.moveNumber));
     if (!selected) {
-      totals.belowFloorGames++;
+      totals.noProblemGames++;
+      const noProblemReason = g.solutionStatus === 'NO_TEACHING_ALTERNATIVE'
+        ? 'NO_TEACHING_ALTERNATIVE'
+        : 'NO_NORMAL_RANK_PRACTICE_POSITION';
       for (const m of g.gameMemos) {
         const row = makeBaseRow(g, m);
         const metric = g.allMyMoves?.find(x => x.moveNumber === m.moveNumber);
         Object.assign(row, describeMetric(metric));
         row.top3DistinctSolution = top3Moves.has(m.moveNumber) ? 'YES' : '';
         row.action = 'DELETE';
-        row.reason = 'NO_QUALIFYING_PRACTICE_POSITION';
-        row.analysisStatus = 'OK_BELOW_FLOOR';
+        row.reason = noProblemReason;
+        row.analysisStatus = 'OK_NO_PRACTICE_POSITION';
         rows.push(row);
         deletionMemos.push(m);
       }
       if (!g.gameMemos.length) {
         const row = makeBaseRow(g);
-        row.action = 'NONE'; row.reason = 'NO_QUALIFYING_PRACTICE_POSITION'; row.analysisStatus = 'OK_BELOW_FLOOR';
+        row.action = 'NONE'; row.reason = noProblemReason; row.analysisStatus = 'OK_NO_PRACTICE_POSITION';
         rows.push(row);
       }
       gameSummaries.push({
-        gameId: g.gameId, gameName, myColor: g.myColor, reason: 'NO_QUALIFYING_PRACTICE_POSITION', top3,
+        gameId: g.gameId, gameName, myColor: g.myColor, reason: noProblemReason, top3,
+        normalRank: g.normalRank, normalRankSource: g.normalRankSource, temporaryRank: g.temporaryRank,
+        temporaryQuizProblemCount: g.temporaryQuizProblemCount, resultClass: g.resultClass,
         solutionValidation: sv,
       });
       continue;
     }
 
     totals.qualifyingGames++;
-    // A canonical saved problem is current only if today's analysis still accepts
-    // the derived best first move as one of its saved solution moves. If the same
-    // position exists but its saved solution disagrees with current analysis, plan
-    // a replacement using today's solution. Execution creates+verifies replacements
-    // before deleting the stale memo.
+    const desiredSolutionMoves = canonicalMoveSet(g.solutionMoves?.length ? g.solutionMoves : [selected.solutionMove]);
+    const retrySolutionSync = g.solutionStatus === 'RETRY_SOLUTION_SYNC';
+
+    // If exact normal-rank Good Move enumeration failed transiently, preserve any
+    // existing problem state untouched and retry the sync on the next cleanup run.
+    // A game with no existing memo still gets a best-move-only problem so losses do
+    // not silently disappear from practice.
+    if (retrySolutionSync && g.gameMemos.length) {
+      totals.retrySolutionSyncGames++;
+      for (const m of g.gameMemos) {
+        const row = makeBaseRow(g, m);
+        const metric = g.allMyMoves?.find(x => x.moveNumber === m.moveNumber);
+        Object.assign(row, describeMetric(metric));
+        row.action = 'KEEP';
+        row.reason = 'RETRY_SOLUTION_SYNC_EXISTING_PRESERVED';
+        row.retryStatus = 'RETRY_SOLUTION_SYNC';
+        row.solutionSyncStatus = g.solutionStatus;
+        row.analysisStatus = 'OK_RETRY_SOLUTION_SYNC';
+        rows.push(row);
+      }
+      gameSummaries.push({
+        gameId: g.gameId, gameName, myColor: g.myColor,
+        reason: 'RETRY_SOLUTION_SYNC_EXISTING_PRESERVED',
+        keeperMoveNumber: selected.moveNumber,
+        solutionMove: selected.solutionMove,
+        solutionMoves: desiredSolutionMoves,
+        solutionError: g.solutionError,
+        normalRank: g.normalRank, normalRankSource: g.normalRankSource, temporaryRank: g.temporaryRank,
+        temporaryQuizProblemCount: g.temporaryQuizProblemCount, resultClass: g.resultClass,
+        top3, solutionValidation: sv,
+      });
+      continue;
+    }
+
     const matchingPosition = g.gameMemos.filter(m =>
       m.moveNumber === selected.moveNumber &&
       m.problemColor === g.myColor
     );
-    const matchingCurrentSolution = matchingPosition.filter(m =>
-      (m.primarySolutionMoves ?? []).includes(selected.solutionMove)
-    );
-    const keeperMemo = matchingCurrentSolution.length ? chooseRepresentativeMemo(matchingCurrentSolution) : null;
-    const staleCanonicalPosition = matchingPosition.length > 0 && !keeperMemo;
-    if (staleCanonicalPosition) totals.staleCanonicalSolutionReplacementGames++;
+    const keeperMemo = matchingPosition.length ? chooseRepresentativeMemo(matchingPosition) : null;
     const needsCreate = !keeperMemo;
+    const needsUpdate = keeperMemo && !sameMoveSet(keeperMemo.primarySolutionMoves, desiredSolutionMoves);
     let proposedId = null;
     if (needsCreate) {
       proposedId = deterministicBackfillMemoId(uid, g.gameId, selected.moveNumber);
@@ -4422,7 +5132,8 @@ async function buildPlan(fsClient, uid, args) {
         gameId: g.gameId,
         moveNumber: selected.moveNumber,
         solutionMove: selected.solutionMove,
-        solutionKey: selected.solutionKey,
+        solutionMoves: desiredSolutionMoves,
+        solutionKey: solutionKeyForMoves(desiredSolutionMoves),
         gameDocName: g.game.docName,
         gameUpdateTime: g.game.updateTime,
       };
@@ -4433,18 +5144,36 @@ async function buildPlan(fsClient, uid, args) {
       row.moveNumber = selected.moveNumber;
       row.problemColor = g.myColor;
       row.problemColorSource = selected.problemColorSource ?? '';
-      row.solutionKey = selected.solutionKey;
+      row.solutionKey = solutionKeyForMoves(desiredSolutionMoves);
       row.solutionMove = selected.solutionMove;
+      row.solutionMoves = desiredSolutionMoves.join('|');
       row.solutionSource = selected.solutionSource;
-      row.qualifiesFloor = 'YES'; row.top3DistinctSolution = 'YES';
+      row.normalPointLabel = selected.normalPointLabel ?? '';
+      row.normalWinrateLabel = selected.normalWinrateLabel ?? '';
+      row.top3DistinctSolution = 'YES';
       row.action = 'CREATE';
-      row.reason = g.gameMemos.length ? 'CREATE_CANONICAL_REPLACEMENT' : 'CREATE_CANONICAL_NEW';
+      row.reason = retrySolutionSync
+        ? 'CREATE_BEST_ONLY_RETRY_SOLUTION_SYNC'
+        : (g.gameMemos.length ? 'CREATE_CANONICAL_REPLACEMENT' : 'CREATE_CANONICAL_NEW');
       row.keeperMemoId = proposedId;
-      row.analysisStatus = 'OK';
+      row.retryStatus = retrySolutionSync ? 'RETRY_SOLUTION_SYNC' : '';
+      row.analysisStatus = retrySolutionSync ? 'OK_RETRY_SOLUTION_SYNC' : 'OK';
       rows.push(row);
       if (g.gameMemos.length) totals.replacementCreateGames++; else totals.newCreateGames++;
+      if (retrySolutionSync) totals.retrySolutionSyncGames++;
     } else {
       totals.existingProblemKeptGames++;
+      if (needsUpdate) {
+        updateMemos.push({
+          memoId: keeperMemo.id,
+          docName: keeperMemo.docName,
+          updateTime: keeperMemo.updateTime,
+          gameId: g.gameId,
+          moveNumber: keeperMemo.moveNumber,
+          solutionMoves: desiredSolutionMoves,
+        });
+        totals.updatedSolutionGames++;
+      }
     }
 
     for (const m of g.gameMemos) {
@@ -4452,20 +5181,23 @@ async function buildPlan(fsClient, uid, args) {
       const metric = g.allMyMoves?.find(x => x.moveNumber === m.moveNumber);
       Object.assign(row, describeMetric(metric));
       row.top3DistinctSolution = top3Moves.has(m.moveNumber) ? 'YES' : '';
-      row.qualifiesFloor = metric && qualifiesPracticeFloor(metric) ? 'YES' : '';
       row.keeperMemoId = keeperMemo?.id ?? proposedId ?? '';
       row.analysisStatus = 'OK';
 
       if (keeperMemo && m.id === keeperMemo.id) {
-        row.action = 'KEEP';
-        row.reason = 'CANONICAL_EXISTING_PROBLEM';
+        row.action = needsUpdate ? 'UPDATE' : 'KEEP';
+        row.reason = needsUpdate ? 'UPDATE_CANONICAL_SOLUTIONS' : 'CANONICAL_EXISTING_PROBLEM';
         row.solutionMove = selected.solutionMove;
+        row.solutionMoves = desiredSolutionMoves.join('|');
+        row.solutionKey = solutionKeyForMoves(desiredSolutionMoves);
         row.solutionSource = selected.solutionSource;
+        row.normalPointLabel = selected.normalPointLabel ?? '';
+        row.normalWinrateLabel = selected.normalWinrateLabel ?? '';
       } else {
         row.action = 'DELETE';
         if (m.problemColor && m.problemColor !== g.myColor) row.reason = 'OPPONENT_PROBLEM';
-        else if (m.moveNumber === selected.moveNumber) row.reason = keeperMemo ? 'SAME_POSITION_DUPLICATE' : 'STALE_SOLUTION_AT_CANONICAL_POSITION';
-        else if ((m.primarySolutionMoves ?? []).includes(selected.solutionMove)) row.reason = 'REPEATED_SOLUTION_OTHER_TURN';
+        else if (m.moveNumber === selected.moveNumber) row.reason = 'SAME_POSITION_DUPLICATE';
+        else if ((m.primarySolutionMoves ?? []).some(move => desiredSolutionMoves.includes(move))) row.reason = 'REPEATED_SOLUTION_OTHER_TURN';
         else row.reason = needsCreate ? 'REPLACED_BY_CANONICAL_CREATE' : 'OTHER_MY_MISTAKE';
         deletionMemos.push(m);
       }
@@ -4475,15 +5207,26 @@ async function buildPlan(fsClient, uid, args) {
     gameSummaries.push({
       gameId: g.gameId, gameName, myColor: g.myColor,
       reason: needsCreate
-        ? (staleCanonicalPosition ? 'CREATE_CANONICAL_REPLACEMENT_STALE_SOLUTION' : (g.gameMemos.length ? 'CREATE_CANONICAL_REPLACEMENT' : 'CREATE_CANONICAL_NEW'))
-        : 'CANONICAL_EXISTING_PROBLEM',
+        ? (retrySolutionSync ? 'CREATE_BEST_ONLY_RETRY_SOLUTION_SYNC' : (g.gameMemos.length ? 'CREATE_CANONICAL_REPLACEMENT' : 'CREATE_CANONICAL_NEW'))
+        : (needsUpdate ? 'UPDATE_CANONICAL_SOLUTIONS' : 'CANONICAL_EXISTING_PROBLEM'),
       keeperMemoId: keeperMemo?.id ?? proposedId,
       keeperMoveNumber: selected.moveNumber,
       solutionMove: selected.solutionMove,
+      solutionMoves: desiredSolutionMoves,
       pointLoss: selected.pointLoss,
       myWinrateBefore: selected.myWinrateBefore,
       myWinrateAfter: selected.myWinrateAfter,
       winrateDrop: selected.winrateDrop,
+      normalPointLabel: selected.normalPointLabel,
+      normalWinrateLabel: selected.normalWinrateLabel,
+      normalRank: g.normalRank,
+      normalRankSource: g.normalRankSource,
+      temporaryRank: g.temporaryRank,
+      temporaryQuizProblemCount: g.temporaryQuizProblemCount,
+      resultClass: g.resultClass,
+      solutionStatus: g.solutionStatus,
+      lossZeroQuizFallback: g.lossZeroQuizFallback,
+      playedMoveExcluded: g.playedMoveExcluded,
       top3,
       solutionValidation: sv,
     });
@@ -4492,21 +5235,22 @@ async function buildPlan(fsClient, uid, args) {
   rows.sort((a, b) => `${a.gameId}/${String(a.moveNumber).padStart(5, '0')}/${a.action}/${a.memoId}`.localeCompare(`${b.gameId}/${String(b.moveNumber).padStart(5, '0')}/${b.action}/${b.memoId}`));
 
   return {
-    generatedAt: new Date().toISOString(), uid, myNames: args.me,
+    generatedAt: new Date().toISOString(), uid, myNames: args.me, removePlayers: args.removePlayers,
     problemCount: parsedMemos.length,
     historicalGameCount: historyIds.length,
     selectedGameCount: selectedIds.length,
     selectedExistingMemoCount: parsedMemos.filter(m => m.gameId && selectedSet.has(m.gameId)).length,
-    rows, deletionMemos, createMemos, skippedGames, gameSummaries, totals,
+    rows, deletionMemos, createMemos, updateMemos, skippedGames, gameSummaries, gameRemovalTargets, totals,
     rawMemoDocs: memoDocs,
   };
 }
 
 async function writePlan(plan) {
-  const hash = stablePlanHash(plan.rows);
+  const hash = stablePlanHash(plan.rows, plan.gameRemovalTargets);
   const summary = {
     generatedAt: plan.generatedAt,
     myNames: plan.myNames,
+    removePlayers: plan.removePlayers,
     problemCount: plan.problemCount,
     historicalGameCount: plan.historicalGameCount,
     selectedGameCount: plan.selectedGameCount,
@@ -4514,13 +5258,16 @@ async function writePlan(plan) {
     totals: plan.totals,
     keepCount: plan.rows.filter(r => r.action === 'KEEP').length,
     createCount: plan.rows.filter(r => r.action === 'CREATE').length,
+    updateCount: plan.rows.filter(r => r.action === 'UPDATE').length,
     deleteCount: plan.rows.filter(r => r.action === 'DELETE').length,
     skipCount: plan.rows.filter(r => r.action === 'SKIP').length,
     noneCount: plan.rows.filter(r => r.action === 'NONE').length,
     skippedGameCount: plan.skippedGames.length,
+    gameRemovalCount: plan.gameRemovalTargets.length,
     planHash: hash,
     games: plan.gameSummaries,
     skippedGames: plan.skippedGames,
+    gameRemovalTargets: plan.gameRemovalTargets,
     rows: plan.rows,
   };
   await fs.writeFile(PLAN_JSON, JSON.stringify(summary, null, 2));
@@ -4546,25 +5293,26 @@ function printSummary(plan, hash) {
   console.log(`  eligible games analyzed:              ${t.eligibleGames}`);
   console.log(`  games with qualifying practice move:  ${t.qualifyingGames}`);
   console.log(`    existing canonical problem kept:    ${t.existingProblemKeptGames}`);
+  console.log(`    existing solution set updated:      ${t.updatedSolutionGames}`);
   console.log(`    replacement problem to create:      ${t.replacementCreateGames}`);
   console.log(`    new problem to create:              ${t.newCreateGames}`);
-  console.log(`  games below 1pt / 2% floor:           ${t.belowFloorGames}`);
+  console.log(`  games with no practice position:      ${t.noProblemGames}`);
+  console.log(`  games awaiting solution re-sync:      ${t.retrySolutionSyncGames}`);
   console.log(`  ambiguous/unsupported games skipped:  ${t.skippedGames}`);
+  console.log(`  games explicitly marked for removal:  ${plan.gameRemovalTargets.length}`);
   console.log('');
   console.log(`  KEEP rows:                            ${count('KEEP')}`);
   console.log(`  CREATE rows:                          ${count('CREATE')}`);
+  console.log(`  UPDATE rows:                          ${count('UPDATE')}`);
   console.log(`  DELETE rows:                          ${count('DELETE')}`);
   console.log(`    opponent problems:                  ${delReason('OPPONENT_PROBLEM')}`);
   console.log(`    repeated same solution:             ${delReason('REPEATED_SOLUTION_OTHER_TURN')}`);
   console.log(`    same-position duplicates:           ${delReason('SAME_POSITION_DUPLICATE')}`);
-  console.log(`    stale canonical solutions:          ${delReason('STALE_SOLUTION_AT_CANONICAL_POSITION')}`);
-  console.log(`    other/replaced/below-floor:         ${count('DELETE') - delReason('OPPONENT_PROBLEM') - delReason('REPEATED_SOLUTION_OTHER_TURN') - delReason('SAME_POSITION_DUPLICATE') - delReason('STALE_SOLUTION_AT_CANONICAL_POSITION')}`);
-  console.log(`  games replacing stale canonical solution: ${t.staleCanonicalSolutionReplacementGames}`);
+  console.log(`    other/replaced/no-position:         ${count('DELETE') - delReason('OPPONENT_PROBLEM') - delReason('REPEATED_SOLUTION_OTHER_TURN') - delReason('SAME_POSITION_DUPLICATE')}`);
   console.log(`  SKIP rows:                            ${count('SKIP')}`);
   console.log(`  NONE rows (correctly zero problems):  ${count('NONE')}`);
   console.log(`  plan hash:                            ${hash}`);
   console.log(`  audit files:                          ${PLAN_JSON}, ${PLAN_CSV}`);
-  console.log(`  practice floor:                       ${MIN_POINT_LOSS.toFixed(1)} point OR ${(MIN_WR_DROP * 100).toFixed(0)} percentage-point win-rate loss`);
 }
 
 async function writeMemoBackup(plan) {
@@ -4670,11 +5418,26 @@ async function verifyCreates(fsClient, creates, uid) {
     const doc = found.get(name);
     if (!doc) { problems.push(`${c.gameId}@${c.moveNumber}:missing`); continue; }
     const m = parseMemo(doc);
-    if (m.gameId !== c.gameId || m.moveNumber !== c.moveNumber || !(m.primarySolutionMoves ?? []).includes(c.solutionMove)) {
+    if (m.gameId !== c.gameId || m.moveNumber !== c.moveNumber || !sameMoveSet(m.primarySolutionMoves, c.solutionMoves)) {
       problems.push(`${c.gameId}@${c.moveNumber}:field-mismatch`);
     }
   }
   if (problems.length) throw new Error(`CREATE verification failed for ${problems.slice(0, 10).join(', ')}`);
+}
+
+async function verifySolutionUpdates(fsClient, updates) {
+  if (!updates.length) return;
+  const found = await fsClient.batchGetChunked(updates.map(u => u.docName));
+  const problems = [];
+  for (const u of updates) {
+    const doc = found.get(u.docName);
+    if (!doc) { problems.push(`${u.gameId}@${u.moveNumber}:missing`); continue; }
+    const m = parseMemo(doc);
+    if (m.gameId !== u.gameId || m.moveNumber !== u.moveNumber || !sameMoveSet(m.primarySolutionMoves, u.solutionMoves)) {
+      problems.push(`${u.gameId}@${u.moveNumber}:field-mismatch`);
+    }
+  }
+  if (problems.length) throw new Error(`UPDATE verification failed for ${problems.slice(0, 10).join(', ')}`);
 }
 
 async function executePlan(fsClient, plan, hash, confirmHash, args) {
@@ -4697,9 +5460,24 @@ async function executePlan(fsClient, plan, hash, confirmHash, args) {
       done += batch.length;
       console.log(`  created ${done}/${plan.createMemos.length}`);
     }
-    console.log('Verifying all created problems before deleting anything...');
+  }
+
+  if (plan.updateMemos.length) {
+    console.log(`Updating solution sets in place for ${plan.updateMemos.length} canonical problems...`);
+    let done = 0;
+    for (let i = 0; i < plan.updateMemos.length; i += CREATE_BATCH_SIZE) {
+      const batch = plan.updateMemos.slice(i, i + CREATE_BATCH_SIZE);
+      await fsClient.commitSolutionUpdates(batch);
+      done += batch.length;
+      console.log(`  updated ${done}/${plan.updateMemos.length}`);
+    }
+  }
+
+  if (plan.createMemos.length || plan.updateMemos.length) {
+    console.log('Verifying all creates/updates before deleting anything...');
     await verifyCreates(fsClient, plan.createMemos, plan.uid);
-    console.log('CREATE verification passed.');
+    await verifySolutionUpdates(fsClient, plan.updateMemos);
+    console.log('CREATE/UPDATE verification passed.');
   }
 
   if (plan.deletionMemos.length) {
@@ -4740,7 +5518,8 @@ async function main() {
       await runMemoRestoreStage(fsClient, auth.uid, args);
       return;
     }
-    const plan = await buildPlan(fsClient, auth.uid, args);
+    const quizReader = new AiSenseiQuizReader(auth, auth.uid);
+    const plan = await buildPlan(fsClient, auth.uid, args, quizReader);
     const hash = await writePlan(plan);
     printSummary(plan, hash);
 
@@ -4759,6 +5538,7 @@ async function main() {
       // The importer creates a dedicated upload tab in the user's attached browser; close only
       // that script-owned tab on normal exit, never the user's pre-existing tabs.
       if (auth.uploadPage && !auth.uploadPage.isClosed()) await auth.uploadPage.close().catch(() => {});
+      if (auth.curationPage && !auth.curationPage.isClosed()) await auth.curationPage.close().catch(() => {});
     } else {
       await auth.context.close();
     }
