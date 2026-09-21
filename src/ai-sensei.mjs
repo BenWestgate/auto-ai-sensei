@@ -7,13 +7,15 @@
  *   - Teaching games count as serious games.
  *   - At most one qualifying practice problem per eligible game.
  *   - Consider only the user's played moves.
- *   - Rank mistakes by point loss, de-duplicating by the AI best FIRST solution move.
+ *   - Reproduce AI Sensei's current rank-aware point-loss mistake classification from
+ *     stored KataGo moveInfos and strengthen Student Level one slider step at a time
+ *     until three distinct first-solution mistakes are available (or the range ends).
  *   - Take the top 3 distinct mistakes by point loss.
- *   - Among qualifying top-3 candidates, prefer larger win-rate drop, then point loss.
- *   - A candidate qualifies at >= 1.0 point loss OR >= 2 percentage-point win-rate loss.
- *   - If the canonical problem is already saved with the same first solution move, keep it.
- *   - Otherwise propose/create one canonical problem, then remove superseded problems.
- *   - If no candidate clears the floor, leave that game with zero practice problems.
+ *   - Preserve an existing user-selected position when policy allows it; otherwise
+ *     prefer larger positive win-rate drop, then point loss, then earlier move number.
+ *   - Wins/draws/unknown require the selected position to remain bad at normal rank;
+ *     losses preserve a remembered top-three position even if it is now normal-rank good.
+ *   - Ambiguous/unsupported ownership must end with zero saved problems.
  *
  * Full-history discovery:
  *   - Enumerates the user's :game-data/:uploads collection, plus any game IDs referenced
@@ -61,12 +63,11 @@
  *     --allow-goquest-upload flag and no AI Sensei browser/session is opened.
  *
  * CREATE safety:
- *   - Existing memo at the selected canonical position is replaced when current analysis no longer accepts its saved first solution move.
- *   - New-problem solution extraction uses KataGo moveInfos from the analysis position
- *     immediately before the mistake. The dry-run reports how often this derived first
- *     move agrees with existing saved problems. Review that validation before execution.
- *   - Proposed backfills intentionally store only the validated first best move (one ply),
- *     which is a Firestore memo shape observed in AI Sensei's own bulk-add writes.
+ *   - Existing memo at the selected canonical position is updated in place when its
+ *     accepted first-move solution set changes, preserving training metadata.
+ *   - Solution extraction reproduces AI Sensei's current rank-aware good-move filtering
+ *     from KataGo moveInfos and stores every accepted first move, always including the
+ *     engine best move. The dry-run still reports best-first-move agreement as a diagnostic.
  *   - --execute is dry-run gated by the plan hash; any CREATE rows additionally require
  *     --allow-create. Creates are committed and verified BEFORE any deletions.
  *   - A full raw memo backup is written before execution.
@@ -84,6 +85,9 @@ import { invokedScriptPath } from './cli/commands.mjs';
 import {
   AI_SENSEI_STUDENT_LEVELS,
   TOP_POINT_LOSS_CANDIDATES,
+  aiSenseiGoodMoveSets,
+  aiSenseiPointCategory,
+  aiSenseiWinrateCategory,
   analysisTransitionForMove,
   chooseCanonicalFromQuiz,
   chooseWorstOwnMove,
@@ -93,7 +97,10 @@ import {
   lossTeachingSolutions,
   mergeRankGoodMoveSets,
   normalizeStudentRank,
+  rankAdjustedTopPointLoss,
   selectTopDistinctByFirstSolutionMove,
+  sgfCoordFromBoardLabelClass,
+  shouldForceZeroProblemsForFatal,
   studentRankIndex,
 } from './cleanup/policy.mjs';
 import {
@@ -180,6 +187,8 @@ function parseArgs(argv) {
     confirm: null,
     headless: false,
     maxGames: null,
+    gameIds: [],
+    validateBrowser: false,
     profileDir: PROFILE_DIR,
     cdpUrl: null,
     verbose: false,
@@ -214,6 +223,8 @@ function parseArgs(argv) {
     else if (a === '--headless') out.headless = true;
     else if (a === '--verbose') out.verbose = true;
     else if (a === '--max-games') out.maxGames = Number(argv[++i]);
+    else if (a === '--game-id') out.gameIds.push(argv[++i] ?? '');
+    else if (a === '--validate-browser') out.validateBrowser = true;
     else if (a === '--profile-dir') out.profileDir = path.resolve(argv[++i] ?? PROFILE_DIR);
     else if (a === '--cdp') out.cdpUrl = argv[++i] ?? null;
     else if (a === '--ogs-import') out.ogsImport = true;
@@ -247,6 +258,8 @@ Optional:
   --allow-create         Required with --execute when the plan contains CREATE rows.
   --confirm HASH         Required with --execute. Use the hash printed by dry-run.
   --max-games N          Limit games for testing.
+  --game-id ID           Limit cleanup planning to this exact AI Sensei game ID. Repeat as needed.
+  --validate-browser     Reconcile local rank/solution curation against the live AI Sensei UI.
   --profile-dir PATH     Persistent Playwright browser profile.
   --cdp URL              Attach to an already-running Chrome/Chromium via CDP.
                          Recommended when Google blocks automated sign-in.
@@ -308,6 +321,7 @@ Examples:
 
   out.me = [...new Set(out.me.map(s => s.trim()).filter(Boolean))];
   out.removePlayers = [...new Set(out.removePlayers.map(s => s.trim()).filter(Boolean))];
+  out.gameIds = [...new Set(out.gameIds.map(s => s.trim()).filter(Boolean))];
   const myNames = new Set(out.me.map(normalizeName));
   const overlappingRemovedNames = out.removePlayers.filter(name => myNames.has(normalizeName(name)));
   if (overlappingRemovedNames.length) {
@@ -407,6 +421,8 @@ function replayCliArgs(args) {
   }
   for (const name of args.removePlayers) parts.push('--remove-player', shellQuote(name));
   if (Number.isFinite(args.maxGames)) parts.push('--max-games', String(args.maxGames));
+  for (const gameId of args.gameIds ?? []) parts.push('--game-id', shellQuote(gameId));
+  if (args.validateBrowser) parts.push('--validate-browser');
   if (path.resolve(args.profileDir) !== PROFILE_DIR) parts.push('--profile-dir', shellQuote(args.profileDir));
   if (args.cdpUrl) parts.push('--cdp', shellQuote(args.cdpUrl));
   if (args.headless) parts.push('--headless');
@@ -867,16 +883,29 @@ function playerColorFromGameName(gameName, myNames) {
 
   // Otherwise match the player label exactly after removing only its trailing rank/rating.
   const [whiteLabel, blackLabel] = partsRaw.map(stripTrailingRank);
-  const needles = [...new Set(myNames.map(normalizeName).filter(Boolean))];
+  const aliasesByNormalized = new Map();
+  for (const name of myNames ?? []) {
+    const normalized = normalizeName(name);
+    if (normalized && !aliasesByNormalized.has(normalized)) aliasesByNormalized.set(normalized, name);
+  }
+  const needles = [...aliasesByNormalized.keys()];
 
   const whiteMatches = needles.filter(n => n === whiteLabel);
   const blackMatches = needles.filter(n => n === blackLabel);
 
   if (whiteMatches.length === 1 && blackMatches.length === 0) {
-    return { color: 'white', reason: `MATCHED_WHITE:${whiteMatches[0]}` };
+    return {
+      color: 'white',
+      identityName: aliasesByNormalized.get(whiteMatches[0]) ?? whiteMatches[0],
+      reason: `MATCHED_WHITE:${whiteMatches[0]}`,
+    };
   }
   if (blackMatches.length === 1 && whiteMatches.length === 0) {
-    return { color: 'black', reason: `MATCHED_BLACK:${blackMatches[0]}` };
+    return {
+      color: 'black',
+      identityName: aliasesByNormalized.get(blackMatches[0]) ?? blackMatches[0],
+      reason: `MATCHED_BLACK:${blackMatches[0]}`,
+    };
   }
   if (isAiPlayerLabel(partsRaw[0]) && isAiPlayerLabel(partsRaw[1])) {
     return { color: null, reason: 'NO_USER_SIDE_AI_VS_AI', whiteLabel, blackLabel };
@@ -945,12 +974,6 @@ function matchingRemovedPlayers(gameName, removePlayers) {
   if (!removePlayers?.length) return [];
   const players = new Set(exactPlayersFromGameName(gameName));
   return removePlayers.filter(name => players.has(normalizeName(name)));
-}
-
-function shouldForceZeroProblemsForFatal(reason) {
-  return reason === 'PLAYER_NAME_AMBIGUOUS_OR_NOT_FOUND' ||
-    reason === 'UPLOAD_SGF_INFO_MISSING_PLAYERS' ||
-    reason === 'REMOVABLE_FOREIGN_PLAYER';
 }
 
 function inferAlternatingColorMap(game, gameNodes) {
@@ -1702,8 +1725,10 @@ function quizProblemCountFromText(text) {
 }
 
 function classificationFromText(text) {
-  const m = String(text ?? '').match(/\b(Good move|Inaccuracy|Mistake|Blunder)\b/i);
-  return m ? m[1].toLowerCase().replace(/\s+/g, ' ') : null;
+  const m = String(text ?? '').match(/\b(Good move|AI Move|Inaccuracy|Mistake|Blunder)\b/i);
+  if (!m) return null;
+  const label = m[1].toLowerCase().replace(/\s+/g, ' ');
+  return label === 'ai move' ? 'good move' : label;
 }
 
 async function nearestControlContainer(labelLocator, { minButtons = 0, maxDepth = 6 } = {}) {
@@ -1719,9 +1744,10 @@ async function nearestControlContainer(labelLocator, { minButtons = 0, maxDepth 
 }
 
 class AiSenseiQuizReader {
-  constructor(auth, uid) {
+  constructor(auth, uid, verbose = false) {
     this.auth = auth;
     this.uid = uid;
+    this.verbose = verbose;
     this.page = null;
     this.gameId = null;
   }
@@ -1734,15 +1760,140 @@ class AiSenseiQuizReader {
     return this.page;
   }
 
+  async dismissVisibleDialogs() {
+    const page = await this.ensurePage();
+    for (let round = 0; round < 4; round++) {
+      const dialogs = page.getByRole('dialog');
+      const count = await dialogs.count();
+      let visible = null;
+      for (let i = 0; i < count; i++) {
+        const candidate = dialogs.nth(i);
+        if (await candidate.isVisible().catch(() => false)) {
+          visible = candidate;
+          break;
+        }
+      }
+      if (!visible) return;
+
+      const close = visible.getByRole('button', { name: /^(?:close|cancel|finish)$/i }).first();
+      if (await close.isVisible().catch(() => false)) await close.click().catch(() => {});
+      else await page.keyboard.press('Escape').catch(() => {});
+      await visible.waitFor({ state: 'hidden', timeout: 2_000 }).catch(() => {});
+    }
+  }
+
   async openGame(gameId) {
     const page = await this.ensurePage();
     if (this.gameId !== gameId || !page.url().includes(`/game/${this.uid}/${gameId}`)) {
-      await page.goto(`https://ai-sensei.com/game/${encodeURIComponent(this.uid)}/${encodeURIComponent(gameId)}`, { waitUntil: 'domcontentloaded' });
-      await page.getByText('Student level', { exact: true }).first().waitFor({ state: 'visible', timeout: 30_000 });
-      this.gameId = gameId;
-      await sleep(250);
+      const url = `https://ai-sensei.com/game/${encodeURIComponent(this.uid)}/${encodeURIComponent(gameId)}`;
+      let lastError = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await this.dismissVisibleDialogs();
+          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+          await page.getByText('Student level', { exact: true }).first().waitFor({ state: 'visible', timeout: 30_000 });
+          await this.dismissVisibleDialogs();
+          this.gameId = gameId;
+          await sleep(250);
+          return page;
+        } catch (err) {
+          lastError = err;
+          this.gameId = null;
+          await page.keyboard.press('Escape').catch(() => {});
+          await sleep(250 * attempt);
+        }
+      }
+      throw lastError ?? new Error(`GAME_OPEN_FAILED:${gameId}`);
     }
     return page;
+  }
+
+  async deleteGameViaUi(gameId, { expectedGameName = null } = {}) {
+    const page = await this.ensurePage();
+    const url = `https://ai-sensei.com/game/${encodeURIComponent(this.uid)}/${encodeURIComponent(gameId)}`;
+    await this.dismissVisibleDialogs();
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const menu = page.getByText('Menu', { exact: true }).first();
+    await menu.waitFor({ state: 'visible', timeout: 30_000 });
+
+    if (expectedGameName) {
+      const body = (await page.locator('body').innerText()).toLowerCase();
+      const expectedPlayers = exactPlayersFromGameName(expectedGameName);
+      for (const player of expectedPlayers) {
+        if (!body.includes(String(player).toLowerCase())) {
+          throw new Error(`GAME_DELETE_PAGE_MISMATCH:${gameId}:missing-player=${player}`);
+        }
+      }
+    }
+
+    await menu.click();
+    const deleteItem = page.getByText('Delete Game', { exact: true }).first();
+    await deleteItem.waitFor({ state: 'visible', timeout: 10_000 });
+
+    let jsDialogDecision = null;
+    const onDialog = async dialog => {
+      const message = String(dialog.message() ?? '');
+      if (/delete[\s\S]{0,80}game|game[\s\S]{0,80}delete/i.test(message)) {
+        jsDialogDecision = `accepted:${message}`;
+        await dialog.accept();
+      } else {
+        jsDialogDecision = `rejected:${message}`;
+        await dialog.dismiss();
+      }
+    };
+    page.once('dialog', onDialog);
+    await deleteItem.click();
+    await sleep(250);
+
+    if (jsDialogDecision?.startsWith('rejected:')) {
+      throw new Error(`GAME_DELETE_UNEXPECTED_JS_DIALOG:${gameId}:${jsDialogDecision.slice('rejected:'.length)}`);
+    }
+
+    if (!jsDialogDecision) {
+      // This delete flow is using an in-page confirmation rather than a
+      // JavaScript dialog. Do not leave the one-shot listener armed: a later
+      // game's confirmation must never be handled by a stale listener from
+      // this deletion.
+      page.off('dialog', onDialog);
+      const dialogs = page.getByRole('dialog');
+      let confirmation = null;
+      for (let i = 0; i < await dialogs.count(); i++) {
+        const candidate = dialogs.nth(i);
+        if (!await candidate.isVisible().catch(() => false)) continue;
+        const text = await candidate.innerText().catch(() => '');
+        if (/delete[\s\S]{0,120}game|game[\s\S]{0,120}delete/i.test(text)) {
+          confirmation = candidate;
+          break;
+        }
+      }
+      if (!confirmation) {
+        throw new Error(`GAME_DELETE_CONFIRMATION_NOT_FOUND:${gameId}`);
+      }
+
+      const buttons = confirmation.locator('button,[role="button"]');
+      let confirmButton = null;
+      const buttonTexts = [];
+      for (let i = 0; i < await buttons.count(); i++) {
+        const button = buttons.nth(i);
+        if (!await button.isVisible().catch(() => false)) continue;
+        const text = String(await button.innerText().catch(() => '')).trim();
+        buttonTexts.push(text);
+        if (/^(?:delete|delete game|yes,? delete|confirm)$/i.test(text)) {
+          confirmButton = button;
+          break;
+        }
+      }
+      if (!confirmButton) {
+        throw new Error(`GAME_DELETE_CONFIRM_BUTTON_NOT_FOUND:${gameId}:${buttonTexts.join('|')}`);
+      }
+      await confirmButton.click();
+    }
+
+    await Promise.race([
+      page.waitForURL(current => !current.toString().includes(`/game/${this.uid}/${gameId}`), { timeout: 10_000 }),
+      sleep(2_000),
+    ]).catch(() => {});
+    this.gameId = null;
   }
 
   async studentLevelRow(root = null) {
@@ -1756,130 +1907,266 @@ class AiSenseiQuizReader {
     return uiRankFromText(await row.innerText());
   }
 
-  async clickRankStep(row, direction) {
-    const literal = direction === 'stronger' ? '+' : '-';
-    let control = row.getByText(literal, { exact: true }).first();
-    if (!await control.isVisible().catch(() => false)) {
-      const buttons = row.locator('button,[role="button"]');
-      const count = await buttons.count();
-      if (!count) return false;
-      control = direction === 'stronger' ? buttons.nth(count - 1) : buttons.nth(0);
+  async clickRankSliderStep(root, direction) {
+    for (let dragAttempt = 1; dragAttempt <= 3; dragAttempt++) {
+      const row = await this.studentLevelRow(root);
+      const before = await this.rankInRow(row);
+      const beforeIndex = studentRankIndex(before);
+      if (beforeIndex < 0) throw new Error(`UNREADABLE_STUDENT_LEVEL:${before ?? 'unknown'}`);
+      const nextIndex = beforeIndex + (direction === 'stronger' ? 1 : -1);
+      if (nextIndex < 0 || nextIndex >= AI_SENSEI_STUDENT_LEVELS.length) return false;
+      const expected = AI_SENSEI_STUDENT_LEVELS[nextIndex];
+
+      const sliders = row.locator('.new-slider');
+      let slider = null;
+      for (let i = 0; i < await sliders.count(); i++) {
+        const candidate = sliders.nth(i);
+        if (await candidate.isVisible().catch(() => false)) {
+          slider = candidate;
+          break;
+        }
+      }
+      if (!slider) throw new Error('STUDENT_LEVEL_SLIDER_NOT_FOUND');
+      const box = await slider.boundingBox();
+      if (!box || box.width <= 0 || box.height <= 0) throw new Error('STUDENT_LEVEL_SLIDER_UNMEASURABLE');
+      const knob = slider.locator('.knob').first();
+      const knobBox = await knob.boundingBox();
+      if (!knobBox || knobBox.width <= 0 || knobBox.height <= 0) throw new Error('STUDENT_LEVEL_SLIDER_KNOB_UNMEASURABLE');
+      const travel = box.width - knobBox.width;
+      if (travel <= 0) throw new Error('STUDENT_LEVEL_SLIDER_NO_TRAVEL');
+      const stepPixels = travel / (AI_SENSEI_STUDENT_LEVELS.length - 1);
+      const delta = direction === 'stronger' ? stepPixels : -stepPixels;
+      const startX = knobBox.x + knobBox.width / 2;
+      const startY = knobBox.y + knobBox.height / 2;
+      const page = await this.ensurePage();
+      if (this.verbose) {
+        const sliderClass = await slider.getAttribute('class').catch(() => null);
+        console.warn(`    rank slider ${direction}: ${before} -> ${expected}; step=${stepPixels.toFixed(3)}px; class=${sliderClass ?? ''}; attempt=${dragAttempt}`);
+      }
+      await page.mouse.move(startX, startY);
+      await page.mouse.down();
+      try {
+        await page.mouse.move(startX + delta, startY, { steps: 4 });
+      } finally {
+        await page.mouse.up();
+      }
+      await sleep(150 + 100 * (dragAttempt - 1));
+      const after = await this.rankInRow(await this.studentLevelRow(root));
+      if (after === expected) return true;
+      // A drag that did not register is safe to retry. Any other observed
+      // movement means we can no longer prove that exactly one discrete rank
+      // was traversed, so fail closed instead of trying to compensate.
+      if (after !== before || dragAttempt === 3) {
+        throw new Error(`STUDENT_LEVEL_SLIDER_STEP_MISMATCH:${before}->${after ?? 'unknown'}:expected=${expected}`);
+      }
+      await sleep(200 * dragAttempt);
     }
-    if (await control.isDisabled().catch(() => false)) return false;
-    const before = await this.rankInRow(row);
-    await control.click();
-    await sleep(100);
-    const after = await this.rankInRow(row);
-    return Boolean(after && after !== before);
+    return false;
   }
 
   async setRank(targetRank, root = null) {
     const target = normalizeStudentRank(targetRank);
     if (!target) throw new Error(`UNSUPPORTED_STUDENT_RANK:${targetRank}`);
-    const row = await this.studentLevelRow(root);
     for (let attempt = 0; attempt < AI_SENSEI_STUDENT_LEVELS.length + 5; attempt++) {
+      const row = await this.studentLevelRow(root);
       const current = await this.rankInRow(row);
       if (current === target) return current;
       const ci = studentRankIndex(current);
       const ti = studentRankIndex(target);
       if (ci < 0 || ti < 0) throw new Error(`UNREADABLE_STUDENT_LEVEL:${current ?? 'unknown'}->${target}`);
-      const moved = await this.clickRankStep(row, ti > ci ? 'stronger' : 'weaker');
+      const moved = await this.clickRankSliderStep(root, ti > ci ? 'stronger' : 'weaker');
       if (!moved) throw new Error(`STUDENT_LEVEL_BOUNDARY:${current}->${target}`);
     }
     throw new Error(`STUDENT_LEVEL_SET_TIMEOUT:${target}`);
   }
 
-  async choiceRow(labelText, root = null) {
+  async choiceRow(labelText, choice, root = null) {
     const scope = root ?? await this.ensurePage();
     const label = scope.getByText(labelText, { exact: true }).first();
     await label.waitFor({ state: 'visible', timeout: 10_000 });
-    return nearestControlContainer(label, { maxDepth: 5 });
+    const choicePattern = new RegExp(`^${String(choice).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i');
+    let row = label;
+    for (let depth = 0; depth <= 6; depth++) {
+      const options = row.getByText(choicePattern);
+      const count = await options.count();
+      for (let i = 0; i < count; i++) {
+        const option = options.nth(i);
+        if (await option.isVisible().catch(() => false)) return { row, option };
+      }
+      row = row.locator('xpath=..');
+    }
+    throw new Error(`UI_CHOICE_NOT_FOUND:${labelText}:${choice}`);
   }
 
   async choose(labelText, choice, root = null) {
-    const row = await this.choiceRow(labelText, root);
-    const exact = row.getByText(choice, { exact: true }).first();
-    if (!await exact.isVisible().catch(() => false)) {
-      throw new Error(`UI_CHOICE_NOT_FOUND:${labelText}:${choice}`);
+    const { row, option } = await this.choiceRow(labelText, choice, root);
+    const selected = async () => {
+      const knobs = row.locator('.knob');
+      const count = await knobs.count();
+      for (let i = 0; i < count; i++) {
+        const knob = knobs.nth(i);
+        if (!await knob.isVisible().catch(() => false)) continue;
+        const text = (await knob.innerText()).trim();
+        if (text.localeCompare(String(choice), undefined, { sensitivity: 'accent' }) === 0) return true;
+      }
+      return false;
+    };
+    if (await selected()) return;
+    await option.click();
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await sleep(100);
+      if (await selected()) return;
     }
-    await exact.click();
-    await sleep(100);
+    throw new Error(`UI_CHOICE_DID_NOT_SETTLE:${labelText}:${choice}`);
   }
 
   async openQuizDialog() {
     const page = await this.ensurePage();
-    await page.keyboard.press('Shift+Z').catch(() => {});
-    let heading = page.getByText('Start Quiz', { exact: true }).first();
-    if (!await heading.isVisible().catch(() => false)) {
-      const menu = page.getByText('Menu', { exact: true }).first();
-      if (await menu.isVisible().catch(() => false)) await menu.click();
-      const start = page.getByText('Start Quiz', { exact: true }).first();
-      await start.click();
-      heading = page.getByText('Start Quiz', { exact: true }).first();
-    }
-    await heading.waitFor({ state: 'visible', timeout: 10_000 });
-    const dialog = page.getByRole('dialog').filter({ hasText: 'Start Quiz' }).first();
-    if (await dialog.count()) return dialog;
-    return nearestControlContainer(heading, { maxDepth: 8 });
+    let dialog = page.getByRole('dialog').filter({ hasText: 'Student level' }).first();
+    if (await dialog.isVisible().catch(() => false)) return dialog;
+
+    // Do not use the old Shift+Z shortcut here. On the current AI Sensei UI it
+    // can open a different modal, which then intercepts the Menu click and
+    // poisons every subsequent game in a full-history run.
+    await this.dismissVisibleDialogs();
+    const menu = page.getByText('Menu', { exact: true }).first();
+    await menu.waitFor({ state: 'visible', timeout: 10_000 });
+    await menu.click();
+    const start = page.getByText('Start Quiz', { exact: true }).first();
+    await start.waitFor({ state: 'visible', timeout: 10_000 });
+    await start.click();
+    dialog = page.getByRole('dialog').filter({ hasText: 'Student level' }).first();
+    await dialog.waitFor({ state: 'visible', timeout: 10_000 });
+    return dialog;
   }
 
   async closeQuizDialog(dialog) {
     const cancel = dialog.getByText('Cancel', { exact: true }).first();
     if (await cancel.isVisible().catch(() => false)) await cancel.click();
     else await (await this.ensurePage()).keyboard.press('Escape');
+    await dialog.waitFor({ state: 'hidden', timeout: 5_000 }).catch(() => {});
+    // Start Quiz is opened from the Menu modal. Depending on the current UI
+    // transition, cancelling the Quiz can reveal that Menu modal underneath;
+    // clear it before the next game-page rank/move interaction.
+    await this.dismissVisibleDialogs();
     await sleep(100);
   }
 
-  async startQuizDialog(dialog, expectedCount) {
-    if (expectedCount === 0) {
-      await this.closeQuizDialog(dialog);
-      return false;
+  async ensureQuizAdvancedOptions(dialog) {
+    const avoid = dialog.getByText('Avoid same move', { exact: true }).first();
+    if (await avoid.isVisible().catch(() => false)) return;
+    const advanced = dialog.getByText(/Advanced options/i).first();
+    if (!await advanced.isVisible().catch(() => false)) {
+      throw new Error('QUIZ_ADVANCED_OPTIONS_UNREADABLE');
     }
-    const ok = dialog.getByRole('button', { name: 'OK', exact: true }).first();
-    if (!await ok.isVisible().catch(() => false)) throw new Error('QUIZ_START_BUTTON_UNREADABLE');
-    await ok.click();
-    const page = await this.ensurePage();
-    await page.waitForFunction(count => {
-      const text = document.body?.innerText ?? '';
-      return new RegExp(`\\b1\\s*\\/\\s*${count}\\b`).test(text);
-    }, expectedCount, { timeout: 10_000 });
-    // Force the next openGame() to reload the normal game-analysis view after
-    // confirming that AI Sensei really started the configured Quiz.
-    this.gameId = null;
-    return true;
+    await advanced.click();
+    await avoid.waitFor({ state: 'visible', timeout: 5_000 });
   }
 
-  async chooseTemporaryQuizRank(normalRank, myColor) {
+  async configuredQuizProblemCount(myColor, { rankSettleMs = 500 } = {}) {
+    // The displayed Student level updates before AI Sensei finishes
+    // recomputing the rank-adjusted mistake/Quiz set. Without this settle a
+    // previous-rank count can be observed after the slider already moved.
+    await sleep(rankSettleMs);
     const dialog = await this.openQuizDialog();
+    let observedRank;
+    let count;
     try {
-      await this.setRank(normalRank, dialog);
       await this.choose('Show only', myColor, dialog);
       await this.choose('Sort by', 'point loss', dialog);
+      await this.ensureQuizAdvancedOptions(dialog);
       await this.choose('Avoid same move', 'on', dialog);
-      const row = await this.studentLevelRow(dialog);
-      let selected = null;
-      for (let attempt = 0; attempt < AI_SENSEI_STUDENT_LEVELS.length + 5; attempt++) {
-        const text = await dialog.innerText();
-        const count = quizProblemCountFromText(text);
-        const rank = await this.rankInRow(row);
-        if (!Number.isInteger(count)) throw new Error('QUIZ_PROBLEM_COUNT_UNREADABLE');
-        if (count >= TOP_POINT_LOSS_CANDIDATES) {
-          selected = { rank, problemCount: count, reachedThree: true };
-          break;
+      observedRank = await this.rankInRow(await this.studentLevelRow(dialog));
+      await sleep(750);
+      let lastCount = null;
+      let stableReads = 0;
+      for (let read = 0; read < 8; read++) {
+        const observed = quizProblemCountFromText(await dialog.innerText());
+        if (!Number.isInteger(observed)) throw new Error('QUIZ_PROBLEM_COUNT_UNREADABLE');
+        count = observed;
+        if (observed === lastCount) stableReads++;
+        else {
+          lastCount = observed;
+          stableReads = 1;
         }
-        const moved = await this.clickRankStep(row, 'stronger');
-        if (!moved) {
-          selected = { rank, problemCount: count, reachedThree: false };
-          break;
+        if (stableReads >= 3) break;
+        await sleep(250);
+      }
+      if (stableReads < 3) throw new Error(`QUIZ_PROBLEM_COUNT_UNSTABLE:${count}`);
+      if (this.verbose) {
+        console.warn(`    quiz config rank=${observedRank ?? 'unknown'} count=${count}: ${JSON.stringify(await dialog.innerText())}`);
+      }
+    } finally {
+      await this.closeQuizDialog(dialog).catch(() => {});
+    }
+    return { rank: normalizeStudentRank(observedRank), problemCount: count };
+  }
+
+  async pointMistakeAtCurrentRank(moveNumber, gameLength) {
+    await this.setScoreMode('points');
+    // Student-level and score-mode changes update the controls before AI
+    // Sensei refreshes the current move's classification panel. If the probe
+    // move is already selected, force one navigation cycle so the label is
+    // recomputed for the newly selected rank/mode.
+    await this.seekMove(moveNumber, gameLength, { refreshIfAlreadyThere: true });
+    const text = await this.readNextMovePanelText();
+    const label = classificationFromText(text);
+    if (!label) throw new Error(`MOVE_CLASSIFICATION_UNREADABLE@${moveNumber}:points`);
+    // AI Sensei's Quiz problem count used for Student Level escalation treats
+    // point-loss Mistake/Blunder as problems; Inaccuracy does not advance the
+    // rank-search count. Keep the browser sentinel aligned with that rule.
+    return isWinrateVetoLabel(label);
+  }
+
+  async chooseTemporaryQuizRank(normalRank, myColor, {
+    rankSettleMs = 500,
+    probeMoveNumber = null,
+    gameLength = null,
+  } = {}) {
+    let rank = normalizeStudentRank(normalRank);
+    if (!rank) throw new Error(`UNSUPPORTED_STUDENT_RANK:${normalRank}`);
+    const canProbe = Number.isInteger(probeMoveNumber) && probeMoveNumber >= 1 && Number.isInteger(gameLength) && gameLength >= 1;
+    let firstRank = true;
+
+    // Always verify the normal-rank Quiz count. When fewer than three problems
+    // exist, step the real Student level slider exactly one rank at a time. The
+    // third-largest distinct point-loss candidate is a cheap sentinel: ranks at
+    // which it is still Good Move cannot possibly be the final reconciled top-3
+    // rank. We reopen Quiz when the sentinel becomes a mistake, at the strongest
+    // rank, or on the legacy/fallback path where no safe sentinel is available.
+    // curateGameFromQuiz still classifies the complete candidate set at the
+    // returned rank and compares it with Quiz; any disagreement retries using
+    // the legacy every-rank Quiz reads below (probeMoveNumber omitted).
+    for (let attempt = 0; attempt < AI_SENSEI_STUDENT_LEVELS.length + 5; attempt++) {
+      await this.setRank(rank);
+      const index = studentRankIndex(rank);
+      if (index < 0) throw new Error(`UNREADABLE_STUDENT_LEVEL:${rank}`);
+      const strongest = index >= AI_SENSEI_STUDENT_LEVELS.length - 1;
+      let shouldReadQuiz = firstRank || strongest || !canProbe;
+      if (!shouldReadQuiz) {
+        shouldReadQuiz = await this.pointMistakeAtCurrentRank(probeMoveNumber, gameLength);
+      }
+
+      if (shouldReadQuiz) {
+        const observed = await this.configuredQuizProblemCount(myColor, { rankSettleMs });
+        rank = observed.rank ?? rank;
+        if (observed.problemCount >= TOP_POINT_LOSS_CANDIDATES) {
+          return { rank, problemCount: observed.problemCount, reachedThree: true, quizStarted: false };
+        }
+        const observedIndex = studentRankIndex(rank);
+        if (observedIndex < 0 || observedIndex >= AI_SENSEI_STUDENT_LEVELS.length - 1) {
+          return { rank, problemCount: observed.problemCount, reachedThree: false, quizStarted: false };
         }
       }
-      if (!selected) throw new Error('QUIZ_RANK_ESCALATION_TIMEOUT');
-      const quizStarted = await this.startQuizDialog(dialog, selected.problemCount);
-      return { ...selected, quizStarted };
-    } catch (err) {
-      await this.closeQuizDialog(dialog).catch(() => {});
-      throw err;
+
+      const nextIndex = studentRankIndex(rank) + 1;
+      if (nextIndex <= 0 || nextIndex >= AI_SENSEI_STUDENT_LEVELS.length) {
+        throw new Error(`QUIZ_RANK_ESCALATION_BOUNDARY:${rank}`);
+      }
+      rank = AI_SENSEI_STUDENT_LEVELS[nextIndex];
+      firstRank = false;
     }
+    throw new Error('QUIZ_RANK_ESCALATION_TIMEOUT');
   }
 
   async setScoreMode(mode) {
@@ -1903,32 +2190,32 @@ class AiSenseiQuizReader {
 
   async readNextMoveNumber() {
     const text = await this.readNextMovePanelText();
-    const m = text.match(/Next\s+game\s+move\s*\n?\s*(\d{1,4})\b/i);
+    const m = text.match(/Next\s+game\s+move\s*(?:\n\s*AI enabled\s*)?\n?\s*(\d{1,4})\b/i);
+    if (!m && this.verbose) console.warn(`    next move panel text: ${JSON.stringify(text)}`);
     return m ? Number(m[1]) : null;
   }
 
-  async stepMove(direction) {
+  async stepMove(direction, { keyboardOnly = false } = {}) {
     const page = await this.ensurePage();
-    const name = direction === 'next' ? /next\s+(?:game\s+)?move/i : /prev(?:ious)?\s+(?:game\s+)?move/i;
-    const locator = page.locator('[title],[aria-label]').filter({ has: page.locator(':scope') });
-    const candidates = page.locator(direction === 'next'
-      ? '[title*="next move" i],[aria-label*="next move" i],[title*="next game move" i],[aria-label*="next game move" i]'
-      : '[title*="prev move" i],[aria-label*="prev move" i],[title*="previous move" i],[aria-label*="previous move" i]');
-    if (await candidates.count()) {
-      const control = candidates.first();
-      if (await control.isVisible().catch(() => false)) {
-        await control.click();
-        await sleep(75);
-        return;
+    if (!keyboardOnly) {
+      const candidates = page.locator(direction === 'next'
+        ? '[title*="next move" i],[aria-label*="next move" i],[title*="next game move" i],[aria-label*="next game move" i]'
+        : '[title*="prev move" i],[aria-label*="prev move" i],[title*="previous move" i],[aria-label*="previous move" i]');
+      if (await candidates.count()) {
+        const control = candidates.first();
+        if (await control.isVisible().catch(() => false)) {
+          await control.click();
+          await sleep(100);
+          return;
+        }
       }
     }
-    void locator; void name;
     await page.locator('body').click({ position: { x: 2, y: 2 } }).catch(() => {});
     await page.keyboard.press(direction === 'next' ? 'ArrowRight' : 'ArrowLeft');
-    await sleep(75);
+    await sleep(100);
   }
 
-  async seekMove(moveNumber, gameLength) {
+  async seekMove(moveNumber, gameLength, { refreshIfAlreadyThere = false } = {}) {
     let current = await this.readNextMoveNumber().catch(() => null);
     if (!Number.isInteger(current)) {
       for (let i = 0; i < Math.min(gameLength + 2, 8) && !Number.isInteger(current); i++) {
@@ -1937,12 +2224,34 @@ class AiSenseiQuizReader {
       }
     }
     if (!Number.isInteger(current)) throw new Error(`MOVE_NAVIGATION_UNREADABLE@${moveNumber}`);
+    if (refreshIfAlreadyThere && current === moveNumber) {
+      const direction = moveNumber > 1 ? 'prev' : 'next';
+      const returnDirection = direction === 'prev' ? 'next' : 'prev';
+      const before = current;
+      await this.stepMove(direction);
+      current = await this.readNextMoveNumber().catch(() => null);
+      if (!Number.isInteger(current) || current === before) {
+        throw new Error(`MOVE_REFRESH_FAILED@${moveNumber}`);
+      }
+      await this.stepMove(returnDirection);
+      current = await this.readNextMoveNumber().catch(() => null);
+      if (current !== moveNumber) throw new Error(`MOVE_REFRESH_RETURN_FAILED@${moveNumber}:${current ?? 'unknown'}`);
+    }
     for (let i = 0; i < gameLength + 4 && current !== moveNumber; i++) {
       const before = current;
-      await this.stepMove(current < moveNumber ? 'next' : 'prev');
+      const direction = current < moveNumber ? 'next' : 'prev';
+      await this.stepMove(direction);
       current = await this.readNextMoveNumber().catch(() => null);
       if (!Number.isInteger(current)) throw new Error(`MOVE_NAVIGATION_LOST@${moveNumber}`);
-      if (current === before) throw new Error(`MOVE_NAVIGATION_STUCK@${moveNumber}`);
+      if (current === before) {
+        // The visible navigation button occasionally consumes a click without
+        // advancing the analysis position. Fall back to AI Sensei's keyboard
+        // shortcut once before failing closed.
+        await this.stepMove(direction, { keyboardOnly: true });
+        current = await this.readNextMoveNumber().catch(() => null);
+        if (!Number.isInteger(current)) throw new Error(`MOVE_NAVIGATION_LOST@${moveNumber}`);
+        if (current === before) throw new Error(`MOVE_NAVIGATION_STUCK@${moveNumber}`);
+      }
     }
     if (current !== moveNumber) throw new Error(`MOVE_NAVIGATION_TIMEOUT@${moveNumber}`);
   }
@@ -1950,7 +2259,7 @@ class AiSenseiQuizReader {
   async classifyMove(moveNumber, { rank, mode, gameLength }) {
     await this.setRank(rank);
     await this.setScoreMode(mode);
-    await this.seekMove(moveNumber, gameLength);
+    await this.seekMove(moveNumber, gameLength, { refreshIfAlreadyThere: true });
     const text = await this.readNextMovePanelText();
     const label = classificationFromText(text);
     if (!label) throw new Error(`MOVE_CLASSIFICATION_UNREADABLE@${moveNumber}:${mode}`);
@@ -1961,9 +2270,13 @@ class AiSenseiQuizReader {
     await this.setRank(rank);
     await this.setScoreMode(mode);
     const out = new Map();
+    let first = true;
     for (const moveNumber of [...new Set(moveNumbers)].sort((a, b) => a - b)) {
-      await this.seekMove(moveNumber, gameLength);
-      const label = classificationFromText(await this.readNextMovePanelText());
+      await this.seekMove(moveNumber, gameLength, { refreshIfAlreadyThere: first });
+      first = false;
+      const text = await this.readNextMovePanelText();
+      const label = classificationFromText(text);
+      if (!label && this.verbose) console.warn(`    unreadable classification panel: ${JSON.stringify(text)}`);
       if (!label) throw new Error(`MOVE_CLASSIFICATION_UNREADABLE@${moveNumber}:${mode}`);
       out.set(moveNumber, { label, bad: isBadQuizLabel(label) });
     }
@@ -1977,70 +2290,51 @@ class AiSenseiQuizReader {
     });
   }
 
-  async domMovesMatchingFingerprint(boardSize, markerSource) {
+  async domBoardCategoryMoves(boardSize, categories) {
     const page = await this.ensurePage();
-    const raw = await page.locator('body *').evaluateAll((elements, source) => {
-      const marker = new RegExp(source, 'i');
-      const out = [];
-      for (const el of elements) {
-        const rect = el.getBoundingClientRect();
-        if (!rect.width || !rect.height) continue;
-        const attrs = {};
-        for (const name of ['class', 'title', 'aria-label', 'data-coordinate', 'data-coord', 'data-move', 'data-point', 'data-vertex']) {
-          const v = el.getAttribute?.(name);
-          if (v) attrs[name] = v;
-        }
-        const text = String(el.textContent ?? '').trim().slice(0, 80);
-        const fingerprint = `${Object.values(attrs).join(' ')} ${text}`;
-        if (!marker.test(fingerprint)) continue;
-        out.push({ attrs, text });
-      }
-      return out;
-    }, markerSource);
+    const selector = categories.map(category => `svg.board g.${category}`).join(',');
+    const raw = await page.locator(selector).evaluateAll(elements => elements.map(el => el.getAttribute('class') ?? ''));
     const moves = new Set();
-    for (const item of raw) {
-      const direct = item.attrs['data-coordinate'] ?? item.attrs['data-coord'] ?? item.attrs['data-move'] ?? item.attrs['data-point'] ?? item.attrs['data-vertex'];
-      const values = [direct, item.attrs.title, item.attrs['aria-label'], item.text].filter(Boolean);
-      for (const value of values) {
-        const text = String(value).trim();
-        if (/^[a-z]{2}$/i.test(text)) {
-          const move = sgfCoordFromGtp(text, boardSize);
-          if (move) moves.add(move);
-        }
-        for (const match of text.matchAll(/\b([A-HJ-T](?:1\d|[1-9]))\b/gi)) {
-          const move = sgfCoordFromGtp(match[1], boardSize);
-          if (move) moves.add(move);
-        }
-      }
+    for (const className of raw) {
+      const move = sgfCoordFromBoardLabelClass(className, boardSize);
+      if (move) moves.add(move);
     }
     return [...moves].sort();
   }
 
   async domSuggestionMoves(boardSize) {
-    return this.domMovesMatchingFingerprint(boardSize, '(good|best|suggest|policy|candidate|hint|recommend)');
+    return this.domBoardCategoryMoves(boardSize, ['ai-move', 'good-move']);
   }
 
   async domWinrateVetoMoves(boardSize) {
-    return this.domMovesMatchingFingerprint(boardSize, '(mistake|blunder)');
+    return this.domBoardCategoryMoves(boardSize, ['mistake', 'blunder']);
   }
 
   async goodMovesAtPosition(moveNumber, { normalRank, bestMove, boardSize, gameLength }) {
     await this.setRank(normalRank);
     await this.enableSuggestionOverlay();
-    await this.seekMove(moveNumber, gameLength);
     await this.setScoreMode('points');
-    await sleep(150);
-    const pointGoodMoves = await this.domSuggestionMoves(boardSize);
+    await this.seekMove(moveNumber, gameLength, { refreshIfAlreadyThere: true });
+    await sleep(300);
+    let pointGoodMoves = await this.domSuggestionMoves(boardSize);
+    for (let attempt = 0; !pointGoodMoves.length && attempt < 3; attempt++) {
+      await sleep(300);
+      pointGoodMoves = await this.domSuggestionMoves(boardSize);
+    }
     await this.setScoreMode('winrate');
-    await sleep(150);
-    const winrateGoodMoves = await this.domSuggestionMoves(boardSize);
-    const winrateBadMoves = await this.domWinrateVetoMoves(boardSize);
-    const winrateEvidence = new Set([...winrateGoodMoves, ...winrateBadMoves]);
-    const unresolvedPointMoves = pointGoodMoves.filter(move => !winrateEvidence.has(move));
-    if (!pointGoodMoves.length || unresolvedPointMoves.length) {
+    await this.seekMove(moveNumber, gameLength, { refreshIfAlreadyThere: true });
+    await sleep(300);
+    let winrateGoodMoves = await this.domSuggestionMoves(boardSize);
+    let winrateBadMoves = await this.domWinrateVetoMoves(boardSize);
+    for (let attempt = 0; !winrateGoodMoves.length && !winrateBadMoves.length && attempt < 3; attempt++) {
+      await sleep(300);
+      winrateGoodMoves = await this.domSuggestionMoves(boardSize);
+      winrateBadMoves = await this.domWinrateVetoMoves(boardSize);
+    }
+    if (!pointGoodMoves.length || (!winrateGoodMoves.length && !winrateBadMoves.length)) {
       return {
         ok: false,
-        reason: `GOOD_MOVE_OVERLAY_UNREADABLE:points=${pointGoodMoves.length}:winrate-good=${winrateGoodMoves.length}:winrate-bad=${winrateBadMoves.length}:unresolved=${unresolvedPointMoves.join('|')}`,
+        reason: `GOOD_MOVE_OVERLAY_UNREADABLE:points=${pointGoodMoves.length}:winrate-good=${winrateGoodMoves.length}:winrate-bad=${winrateBadMoves.length}`,
         pointGoodMoves,
         winrateGoodMoves,
         winrateBadMoves,
@@ -2067,7 +2361,7 @@ class AiSenseiQuizReader {
     const text = await page.locator('body').innerText();
     const section = text.match(/AI Rank Prediction[\s\S]{0,500}/i)?.[0] ?? text;
     const rank = uiRankFromText(section);
-    await page.keyboard.press('Escape').catch(() => {});
+    await this.dismissVisibleDialogs();
     return rank;
   }
 }
@@ -2434,6 +2728,12 @@ function stablePlanHash(rows, gameRemovalTargets = []) {
   const minimalGameRemovals = gameRemovalTargets.map(g => ({
     gameId: g.gameId,
     matchedPlayers: [...(g.matchedPlayers ?? [])].map(normalizeName).sort(),
+    uploadDocName: g.uploadDocName ?? null,
+    uploadUpdateTime: g.uploadUpdateTime ?? null,
+    gameDocName: g.gameDocName ?? null,
+    gameUpdateTime: g.gameUpdateTime ?? null,
+    gameNodeDocName: g.gameNodeDocName ?? null,
+    gameNodeUpdateTime: g.gameNodeUpdateTime ?? null,
   })).sort((a, b) => a.gameId.localeCompare(b.gameId));
   return crypto.createHash('sha256')
     .update(JSON.stringify({ rows: minimalRows, gameRemovals: minimalGameRemovals }))
@@ -2490,37 +2790,64 @@ function findMoveInfoArrays(value, pathName = '', out = [], seen = new Set()) {
 }
 
 function extractBestFirstMove(fields, boardSize = 19) {
+  const parsed = extractAnalysisMoveInfos(fields, boardSize);
+  if (!parsed) return null;
+  const best = parsed.bestMoves[0];
+  return {
+    firstMove: best.move,
+    pv: best.pv.length && best.pv[0] === best.move
+      ? best.pv
+      : [best.move, ...best.pv.filter((x, i) => i > 0 || x !== best.move)],
+    source: parsed.source,
+    score: parsed.score,
+  };
+}
+
+function extractAnalysisMoveInfos(fields, boardSize = 19) {
   const arrays = findMoveInfoArrays(fields);
   const candidates = [];
   for (const hit of arrays) {
     const infos = hit.value.filter(x => x && typeof x === 'object' && !Array.isArray(x));
     if (!infos.length) continue;
-    const ranked = infos.map((info, index) => {
+    const bestMoves = infos.map((info, index) => {
       const rawMove = getLoose(info, ['move']);
       const move = sgfCoordFromGtp(rawMove, boardSize);
       const visitsRaw = getLoose(info, ['visits']);
-      const orderRaw = getLoose(info, ['order']);
-      const visits = Number.isFinite(Number(visitsRaw)) ? Number(visitsRaw) : null;
-      const order = Number.isFinite(Number(orderRaw)) ? Number(orderRaw) : null;
+      const playouts = Number.isFinite(Number(visitsRaw)) ? Number(visitsRaw) : null;
+      const winrateRaw = Number(getLoose(info, ['winrate']));
+      const winrate = Number.isFinite(winrateRaw)
+        ? (Math.abs(winrateRaw) <= 1.000001 ? winrateRaw * 100 : winrateRaw)
+        : null;
+      const scoreLeadRaw = Number(getLoose(info, ['scoreLead']));
+      const scoreMeanRaw = Number(getLoose(info, ['scoreMean']));
+      const scoreMean = Number.isFinite(scoreLeadRaw)
+        ? scoreLeadRaw
+        : (Number.isFinite(scoreMeanRaw) ? scoreMeanRaw : null);
+      const symmetryRaw = getLoose(info, ['isSymmetryOf']);
       const pvRaw = getLoose(info, ['pv']);
       const pv = Array.isArray(pvRaw) ? pvRaw.map(x => sgfCoordFromGtp(x, boardSize)).filter(Boolean) : [];
-      return { move, visits, order, pv, index, rawMove };
+      return {
+        move,
+        playouts,
+        winrate,
+        scoreMean,
+        symmetry: symmetryRaw != null && symmetryRaw !== false,
+        pv,
+        index,
+        rawMove,
+      };
     }).filter(x => x.move);
-    if (!ranked.length) continue;
-    ranked.sort((a, b) => {
-      if (a.order != null || b.order != null) return (a.order ?? 1e9) - (b.order ?? 1e9);
-      if (a.visits != null || b.visits != null) return (b.visits ?? -1) - (a.visits ?? -1);
-      return a.index - b.index;
-    });
-    const best = ranked[0];
+    if (!bestMoves.length) continue;
+    const best = bestMoves[0];
     let score = 0;
     if (/decompressed.?gzip/i.test(hit.path)) score += 100;
     if (/\.json\.?/i.test(hit.path)) score += 20;
-    if (best.visits != null) score += 10;
+    if (best.playouts != null) score += 10;
     if (best.pv.length) score += 5;
+    if (best.winrate != null) score += 5;
+    if (best.scoreMean != null) score += 5;
     candidates.push({
-      firstMove: best.move,
-      pv: best.pv.length && best.pv[0] === best.move ? best.pv : [best.move, ...best.pv.filter((x, i) => i > 0 || x !== best.move)],
+      bestMoves,
       source: `MOVEINFOS:${hit.path}`,
       score,
     });
@@ -2534,10 +2861,50 @@ function buildSolutionIndexFromPlainDocs(plainDocs, boardSize = 19) {
   for (const d of plainDocs) {
     const position = firestoreAnalysisPositionId(d.id);
     if (position == null) continue;
-    const best = extractBestFirstMove(d.fields, boardSize);
-    if (best) out.set(position, best);
+    const parsed = extractAnalysisMoveInfos(d.fields, boardSize);
+    if (!parsed) continue;
+    const best = parsed.bestMoves[0];
+    out.set(position, {
+      firstMove: best.move,
+      pv: best.pv.length && best.pv[0] === best.move
+        ? best.pv
+        : [best.move, ...best.pv.filter((x, i) => i > 0 || x !== best.move)],
+      source: parsed.source,
+      bestMoves: parsed.bestMoves,
+    });
   }
   return out;
+}
+
+function candidateMetricsFromMoveInfos(moveNumber, solutionIndex) {
+  const beforePosition = moveNumber - 1;
+  const before = solutionIndex.get(beforePosition)?.bestMoves?.[0] ?? null;
+  const after = solutionIndex.get(moveNumber)?.bestMoves?.[0] ?? null;
+  if (!before || !after) {
+    return { ok: false, reason: `MISSING_MOVEINFOS_TRANSITION:${beforePosition}->${moveNumber}` };
+  }
+
+  const pointLoss = Number.isFinite(before.scoreMean) && Number.isFinite(after.scoreMean)
+    ? Math.max(0, before.scoreMean + after.scoreMean)
+    : null;
+  const winrateDrop = Number.isFinite(before.winrate) && Number.isFinite(after.winrate)
+    ? Math.max(0, (before.winrate + after.winrate - 100) / 100)
+    : null;
+  if (!Number.isFinite(pointLoss)) {
+    return { ok: false, reason: `MISSING_MOVEINFOS_SCORE:${beforePosition}->${moveNumber}` };
+  }
+
+  return {
+    ok: true,
+    actualMove: moveNumber,
+    beforePosition,
+    pointLoss,
+    myWinrateBefore: Number.isFinite(before.winrate) ? before.winrate / 100 : null,
+    myWinrateAfter: Number.isFinite(after.winrate) ? 1 - after.winrate / 100 : null,
+    winrateDrop,
+    winrateAvailable: Number.isFinite(winrateDrop),
+    metricSource: 'MOVEINFOS_FRONTEND_FORMULA',
+  };
 }
 
 // ------------------------------ GoQuest discovery stage ------------------------------
@@ -4622,39 +4989,234 @@ async function currentOgsRankForAliases(aliases) {
 async function resolveNormalStudentRank(g, quizReader, args, currentRankResolver) {
   const historical = gameTimeRank(g.game, g.myColor);
   if (historical.rank) return historical;
-  try {
-    const predicted = normalizeStudentRank(await quizReader.aiRankPrediction(g.gameId));
-    if (predicted) return { rank: predicted, source: 'AI_RANK_PREDICTION' };
-  } catch (err) {
-    if (args.verbose) console.warn(`  ${g.gameId}: AI Rank Prediction unavailable: ${err.message}`);
-  }
-  const current = await currentRankResolver();
+  const current = await currentRankResolver(g.identityName ?? null);
   if (current.rank) return current;
   return { rank: '10k', source: 'DEFAULT_10K' };
+}
+
+function curateGameLocally(g, normalRankInfo) {
+  const normalRank = normalRankInfo.rank;
+  const resultClass = gameResultClass(g.game, g.myColor);
+  const allCandidates = g.rawCandidates ?? [];
+  const temporary = rankAdjustedTopPointLoss(allCandidates, normalRank);
+  if (temporary.error) throw new Error(`LOCAL_RANK_CURATION_FAILED:${temporary.error}`);
+
+  let top3 = temporary.top;
+  let lossZeroQuizFallback = false;
+  if (!top3.length && resultClass === 'loss') {
+    const fallback = chooseWorstOwnMove(allCandidates.filter(candidate => candidate.solutionMove));
+    top3 = fallback.keeper ? [fallback.keeper] : [];
+    lossZeroQuizFallback = Boolean(fallback.keeper);
+  }
+
+  top3 = top3.map(candidate => {
+    const normalPointLabel = aiSenseiPointCategory(candidate.pointLoss, normalRank, { aiMove: candidate.aiMove === true });
+    const normalWinrateLabel = aiSenseiWinrateCategory(candidate.winrateDrop, normalRank, { aiMove: candidate.aiMove === true });
+    return {
+      ...candidate,
+      normalPointLabel,
+      normalWinrateLabel,
+      normalBadByPoint: isBadQuizLabel(normalPointLabel),
+      normalBadByWinrate: isWinrateVetoLabel(normalWinrateLabel),
+    };
+  });
+
+  if (!top3.length) {
+    return {
+      normalRank,
+      normalRankSource: normalRankInfo.source,
+      temporaryRank: temporary.rank,
+      temporaryQuizProblemCount: temporary.problemCount,
+      resultClass,
+      top3: [],
+      selection: { keeper: null, eligible: [], ranked: [] },
+      solutionStatus: 'NOT_NEEDED',
+      lossZeroQuizFallback,
+      curationSource: 'LOCAL_FRONTEND_EQUIVALENT',
+    };
+  }
+
+  const top3MoveNumbers = new Set(top3.map(candidate => candidate.moveNumber));
+  const rememberedTop3 = g.gameMemos.filter(memo =>
+    memo.problemColor === g.myColor && top3MoveNumbers.has(memo.moveNumber)
+  );
+  const preferredExistingMemo = rememberedTop3.length ? chooseRepresentativeMemo(rememberedTop3) : null;
+  const selection = chooseCanonicalFromQuiz(top3, {
+    resultClass,
+    preferredExistingMoveNumber: preferredExistingMemo?.moveNumber ?? null,
+  });
+  if (!selection.keeper) {
+    return {
+      normalRank,
+      normalRankSource: normalRankInfo.source,
+      temporaryRank: temporary.rank,
+      temporaryQuizProblemCount: temporary.problemCount,
+      resultClass,
+      top3,
+      selection,
+      solutionStatus: 'NOT_NEEDED',
+      lossZeroQuizFallback,
+      curationSource: 'LOCAL_FRONTEND_EQUIVALENT',
+    };
+  }
+
+  let playedBestFallback = null;
+  for (const candidate of selection.ranked) {
+    const solution = g.solutionIndex?.get(candidate.moveNumber - 1);
+    const bestMove = solution?.firstMove ?? candidate.solutionMove ?? null;
+    const playedMove = candidate.playedMove ?? normalizeSolutionMove(g.game.moves[candidate.moveNumber - 1]);
+    const local = aiSenseiGoodMoveSets(solution?.bestMoves, {
+      rank: normalRank,
+      playedMove,
+      playedPointLoss: candidate.pointLoss,
+      playedWinrateDrop: candidate.winrateDrop,
+    });
+    if (!local.ok) {
+      return {
+        normalRank,
+        normalRankSource: normalRankInfo.source,
+        temporaryRank: temporary.rank,
+        temporaryQuizProblemCount: temporary.problemCount,
+        resultClass,
+        top3,
+        selection: { ...selection, keeper: candidate },
+        solutionMoves: bestMove ? [bestMove] : [],
+        solutionStatus: 'RETRY_SOLUTION_SYNC',
+        solutionError: `LOCAL_${local.reason}`,
+        lossZeroQuizFallback,
+        curationSource: 'LOCAL_FRONTEND_EQUIVALENT',
+      };
+    }
+
+    const merged = mergeRankGoodMoveSets({
+      pointGoodMoves: local.pointGoodMoves,
+      winrateBadMoves: local.winrateBadMoves,
+      bestMove,
+    });
+    let solutionMoves = merged;
+    let teaching = null;
+    if (resultClass === 'loss') {
+      teaching = lossTeachingSolutions(solutionMoves, { playedMove, bestMove });
+      solutionMoves = teaching.solutionMoves;
+      if (!solutionMoves.length) {
+        const fallback = lossTeachingSolutions(merged, {
+          playedMove,
+          bestMove,
+          allowPlayedBestFallback: true,
+        });
+        if (fallback.fallbackPlayedBest) {
+          playedBestFallback ??= { candidate, local, fallback, bestMove };
+        }
+        continue;
+      }
+    }
+
+    return {
+      normalRank,
+      normalRankSource: normalRankInfo.source,
+      temporaryRank: temporary.rank,
+      temporaryQuizProblemCount: temporary.problemCount,
+      resultClass,
+      top3,
+      selection: { ...selection, keeper: candidate },
+      solutionMoves,
+      pointGoodMoves: local.pointGoodMoves,
+      winrateGoodMoves: local.winrateGoodMoves,
+      winrateBadMoves: local.winrateBadMoves,
+      solutionStatus: 'SYNCED',
+      playedMoveExcluded: teaching?.playedMoveExcluded ?? false,
+      lossZeroQuizFallback,
+      curationSource: 'LOCAL_FRONTEND_EQUIVALENT',
+    };
+  }
+
+  if (resultClass === 'loss' && playedBestFallback) {
+    const { candidate, local, fallback } = playedBestFallback;
+    return {
+      normalRank,
+      normalRankSource: normalRankInfo.source,
+      temporaryRank: temporary.rank,
+      temporaryQuizProblemCount: temporary.problemCount,
+      resultClass,
+      top3,
+      selection: { ...selection, keeper: candidate },
+      solutionMoves: fallback.solutionMoves,
+      pointGoodMoves: local.pointGoodMoves,
+      winrateGoodMoves: local.winrateGoodMoves,
+      winrateBadMoves: local.winrateBadMoves,
+      solutionStatus: 'SYNCED_PLAYED_BEST_FALLBACK',
+      playedMoveExcluded: false,
+      lossZeroQuizFallback,
+      curationSource: 'LOCAL_FRONTEND_EQUIVALENT',
+    };
+  }
+
+  return {
+    normalRank,
+    normalRankSource: normalRankInfo.source,
+    temporaryRank: temporary.rank,
+    temporaryQuizProblemCount: temporary.problemCount,
+    resultClass,
+    top3,
+    selection: { ...selection, keeper: null },
+    solutionMoves: [],
+    solutionStatus: 'NO_TEACHING_ALTERNATIVE',
+    lossZeroQuizFallback,
+    curationSource: 'LOCAL_FRONTEND_EQUIVALENT',
+  };
 }
 
 async function curateGameFromQuiz(g, quizReader, normalRankInfo) {
   await quizReader.openGame(g.gameId);
   const normalRank = normalRankInfo.rank;
   const resultClass = gameResultClass(g.game, g.myColor);
-  const temporary = await quizReader.chooseTemporaryQuizRank(normalRank, g.myColor);
-  if (temporary.quizStarted) await quizReader.openGame(g.gameId);
   const allCandidates = g.rawCandidates ?? [];
-  const moveNumbers = allCandidates.map(x => x.moveNumber);
-  const tempPoint = await quizReader.classifyMoves(moveNumbers, {
-    rank: temporary.rank,
-    mode: 'points',
+  const probeDistinct = selectTopDistinctByFirstSolutionMove(allCandidates);
+  const probeMoveNumber = !probeDistinct.error && probeDistinct.top.length >= TOP_POINT_LOSS_CANDIDATES
+    ? probeDistinct.top[TOP_POINT_LOSS_CANDIDATES - 1].moveNumber
+    : null;
+  let temporary = await quizReader.chooseTemporaryQuizRank(normalRank, g.myColor, {
+    probeMoveNumber,
     gameLength: g.game.moves.length,
   });
+  if (temporary.quizStarted) await quizReader.openGame(g.gameId);
+  const moveNumbers = allCandidates.map(x => x.moveNumber);
+  const readTemporaryCandidates = async temporaryInfo => {
+    const tempPoint = await quizReader.classifyMoves(moveNumbers, {
+      rank: temporaryInfo.rank,
+      mode: 'points',
+      gameLength: g.game.moves.length,
+    });
+    const quizBad = allCandidates.filter(c =>
+      isWinrateVetoLabel(tempPoint.get(c.moveNumber)?.label)
+    );
+    const distinct = selectTopDistinctByFirstSolutionMove(quizBad);
+    if (distinct.error) throw new Error(distinct.error);
+    const expectedQuizCandidates = Math.min(TOP_POINT_LOSS_CANDIDATES, temporaryInfo.problemCount);
+    const mismatch = distinct.top.length < expectedQuizCandidates ||
+      (temporaryInfo.problemCount < TOP_POINT_LOSS_CANDIDATES && distinct.top.length !== expectedQuizCandidates);
+    return { distinct, expectedQuizCandidates, mismatch };
+  };
 
-  const quizBad = allCandidates.filter(c => tempPoint.get(c.moveNumber)?.bad === true);
-  let distinct = selectTopDistinctByFirstSolutionMove(quizBad);
-  if (distinct.error) throw new Error(distinct.error);
-  const expectedQuizCandidates = Math.min(TOP_POINT_LOSS_CANDIDATES, temporary.problemCount);
-  if (distinct.top.length < expectedQuizCandidates ||
-      (temporary.problemCount < TOP_POINT_LOSS_CANDIDATES && distinct.top.length !== expectedQuizCandidates)) {
-    throw new Error(`QUIZ_CANDIDATE_RECONCILIATION_FAILED:expected=${expectedQuizCandidates}:found=${distinct.top.length}`);
+  let temporaryRead = await readTemporaryCandidates(temporary);
+  if (temporaryRead.mismatch) {
+    const first = temporary;
+    // AI Sensei can display the new rank before its Quiz set has finished
+    // recomputing. Re-run the rank search with a deliberately longer settle
+    // only when browser truth and local classification disagree.
+    temporary = await quizReader.chooseTemporaryQuizRank(normalRank, g.myColor, { rankSettleMs: 2_000 });
+    temporaryRead = await readTemporaryCandidates(temporary);
+    if (temporaryRead.mismatch) {
+      throw new Error(
+        `QUIZ_CANDIDATE_RECONCILIATION_FAILED:normal=${normalRank}` +
+        `:first=${first.rank}/${first.problemCount}:retry=${temporary.rank}/${temporary.problemCount}` +
+        `:expected=${temporaryRead.expectedQuizCandidates}:found=${temporaryRead.distinct.top.length}` +
+        `:moves=${temporaryRead.distinct.top.map(candidate => candidate.moveNumber).join('|')}`
+      );
+    }
   }
+  let distinct = temporaryRead.distinct;
+  const expectedQuizCandidates = temporaryRead.expectedQuizCandidates;
   let top3 = distinct.top.slice(0, expectedQuizCandidates);
   let lossZeroQuizFallback = false;
 
@@ -4699,7 +5261,15 @@ async function curateGameFromQuiz(g, quizReader, normalRankInfo) {
     normalBadByWinrate: isWinrateVetoLabel(normalWinrate.get(candidate.moveNumber)?.label),
   }));
 
-  const selection = chooseCanonicalFromQuiz(top3, { resultClass });
+  const top3MoveNumbers = new Set(top3.map(candidate => candidate.moveNumber));
+  const rememberedTop3 = g.gameMemos.filter(memo =>
+    memo.problemColor === g.myColor && top3MoveNumbers.has(memo.moveNumber)
+  );
+  const preferredExistingMemo = rememberedTop3.length ? chooseRepresentativeMemo(rememberedTop3) : null;
+  const selection = chooseCanonicalFromQuiz(top3, {
+    resultClass,
+    preferredExistingMoveNumber: preferredExistingMemo?.moveNumber ?? null,
+  });
   if (!selection.keeper) {
     return {
       normalRank,
@@ -4807,6 +5377,43 @@ async function curateGameFromQuiz(g, quizReader, normalRankInfo) {
   };
 }
 
+function curationValidationSignature(curation) {
+  const rawTemporaryCount = Number.isInteger(curation?.temporaryQuizProblemCount)
+    ? curation.temporaryQuizProblemCount
+    : null;
+  return {
+    normalRank: curation?.normalRank ?? null,
+    temporaryRank: curation?.temporaryRank ?? null,
+    // Exact Quiz counts can differ from our deterministic first-solution
+    // de-duplication even when AI Sensei exposes the identical top three. The
+    // slider policy only depends on whether the count is 0, 1, 2, or >= 3, so
+    // validate that threshold class rather than an execution-irrelevant raw
+    // count. Top-three moves and labels are still compared exactly below.
+    temporaryQuizProblemCount: rawTemporaryCount == null
+      ? null
+      : Math.min(TOP_POINT_LOSS_CANDIDATES, rawTemporaryCount),
+    top3: (curation?.top3 ?? []).map(candidate => ({
+      moveNumber: candidate.moveNumber,
+      normalPointLabel: candidate.normalPointLabel ?? null,
+      normalWinrateLabel: candidate.normalWinrateLabel ?? null,
+    })),
+    keeperMoveNumber: curation?.selection?.keeper?.moveNumber ?? null,
+    solutionMoves: canonicalMoveSet(curation?.solutionMoves ?? []),
+    solutionStatus: curation?.solutionStatus ?? null,
+  };
+}
+
+function assertBrowserCurationMatchesLocal(gameId, local, browser) {
+  const localSignature = curationValidationSignature(local);
+  const browserSignature = curationValidationSignature(browser);
+  if (JSON.stringify(localSignature) !== JSON.stringify(browserSignature)) {
+    throw new Error(
+      `LOCAL_BROWSER_CURATION_MISMATCH:${gameId}:` +
+      JSON.stringify({ local: localSignature, browser: browserSignature })
+    );
+  }
+}
+
 async function buildPlan(fsClient, uid, args, quizReader) {
   console.log('Fetching full problem library...');
   const memoDocs = await fsClient.allMemos(uid);
@@ -4821,6 +5428,12 @@ async function buildPlan(fsClient, uid, args, quizReader) {
   console.log(`Historical games discovered: ${historyIds.length}`);
 
   let selectedIds = historyIds;
+  if (args.gameIds?.length) {
+    const requested = new Set(args.gameIds);
+    selectedIds = historyIds.filter(gameId => requested.has(gameId));
+    const missing = args.gameIds.filter(gameId => !selectedIds.includes(gameId));
+    if (missing.length) throw new Error(`Requested --game-id not found in cleanup history: ${missing.join(', ')}`);
+  }
   if (Number.isFinite(args.maxGames)) selectedIds = selectedIds.slice(0, args.maxGames);
   console.log(`Historical games in selected scope: ${selectedIds.length}`);
 
@@ -4856,10 +5469,17 @@ async function buildPlan(fsClient, uid, args, quizReader) {
     }
     const matchedRemovedPlayers = matchingRemovedPlayers(game.name, args.removePlayers);
     if (matchedRemovedPlayers.length) {
+      const uploadDoc = uploadDocsById.get(gameId) ?? null;
       gameRemovalTargets.push({
         gameId,
         gameName: game.name,
         matchedPlayers: matchedRemovedPlayers,
+        uploadDocName: uploadDoc?.name ?? null,
+        uploadUpdateTime: uploadDoc?.updateTime ?? null,
+        gameDocName: gameDoc?.name ?? null,
+        gameUpdateTime: gameDoc?.updateTime ?? null,
+        gameNodeDocName: nodeDoc?.name ?? null,
+        gameNodeUpdateTime: nodeDoc?.updateTime ?? null,
       });
       prepared.push({
         gameId, gameMemos, game, gameNodes, myColor: null,
@@ -4873,11 +5493,11 @@ async function buildPlan(fsClient, uid, args, quizReader) {
       continue;
     }
     if (!gameNodes) {
-      prepared.push({ gameId, gameMemos, game, gameNodes, myColor: who.color, fatal: 'NO_ANALYSIS_NODE_DOCUMENT' });
+      prepared.push({ gameId, gameMemos, game, gameNodes, myColor: who.color, identityName: who.identityName ?? null, fatal: 'NO_ANALYSIS_NODE_DOCUMENT' });
       continue;
     }
     if (!Array.isArray(game.moves) || game.moves.length === 0) {
-      prepared.push({ gameId, gameMemos, game, gameNodes, myColor: who.color, fatal: 'EMPTY_GAME_MOVE_RECORD' });
+      prepared.push({ gameId, gameMemos, game, gameNodes, myColor: who.color, identityName: who.identityName ?? null, fatal: 'EMPTY_GAME_MOVE_RECORD' });
       continue;
     }
 
@@ -4890,7 +5510,11 @@ async function buildPlan(fsClient, uid, args, quizReader) {
       colorByMove.set(n, c);
     }
     if (unresolvedMove) {
-      prepared.push({ gameId, gameMemos, game, gameNodes, myColor: who.color, fatal: `INCOMPLETE_MOVE_COLOR_SERIES@${unresolvedMove.moveNumber}:${unresolvedMove.source}` });
+      prepared.push({
+        gameId, gameMemos, game, gameNodes, myColor: who.color,
+        identityName: who.identityName ?? null,
+        fatal: `INCOMPLETE_MOVE_COLOR_SERIES@${unresolvedMove.moveNumber}:${unresolvedMove.source}`,
+      });
       continue;
     }
 
@@ -4901,6 +5525,7 @@ async function buildPlan(fsClient, uid, args, quizReader) {
 
     prepared.push({
       gameId, gameMemos: annotatedMemos, game, gameNodes, myColor: who.color,
+      identityName: who.identityName ?? null,
       colorByMove, alternatingColorMap, fatal: null,
     });
   }
@@ -4934,9 +5559,34 @@ async function buildPlan(fsClient, uid, args, quizReader) {
       for (let n = 1; n <= g.game.moves.length; n++) {
         const c = g.colorByMove.get(n);
         if (c?.color !== g.myColor) continue;
-        const ev = evaluateCandidate({ moveNumber: n, problemColor: c.color }, adapter, g.gameNodes.byId, g.myColor);
-        if (!ev.ok) metricFailures.push({ moveNumber: n, reason: ev.reason });
-        else mine.push({ moveNumber: n, problemColor: c.color, problemColorSource: c.source, ...ev });
+        const inferred = evaluateCandidate({ moveNumber: n, problemColor: c.color }, adapter, g.gameNodes.byId, g.myColor);
+        const exact = candidateMetricsFromMoveInfos(n, solutionIndex);
+        const inferredOnlyFailure = !inferred.ok && inferred.reason !== 'MISSING_POINT_LOSS_AND_SCORE_SERIES';
+        if (inferredOnlyFailure) {
+          metricFailures.push({ moveNumber: n, reason: inferred.reason });
+          continue;
+        }
+        if (exact.ok) {
+          mine.push({
+            moveNumber: n,
+            problemColor: c.color,
+            problemColorSource: c.source,
+            ...(inferred.ok ? inferred : { moverColor: c.color }),
+            ...exact,
+          });
+          continue;
+        }
+        if (inferred.ok) {
+          mine.push({
+            moveNumber: n,
+            problemColor: c.color,
+            problemColorSource: c.source,
+            ...inferred,
+            metricSource: `INFERRED_FALLBACK:${exact.reason}`,
+          });
+          continue;
+        }
+        metricFailures.push({ moveNumber: n, reason: `${exact.reason}|${inferred.reason}` });
       }
       if (metricFailures.length) {
         const sample = metricFailures.slice(0, 5).map(x => `${x.moveNumber}:${x.reason}`).join(',');
@@ -4951,11 +5601,14 @@ async function buildPlan(fsClient, uid, args, quizReader) {
 
       const candidatesWithSolutions = mine.map(c => {
         const sol = solutionIndex.get(c.moveNumber - 1);
+        const playedMove = normalizeSolutionMove(g.game.moves[c.moveNumber - 1]);
         return {
           ...c,
+          playedMove,
           solutionMove: sol?.firstMove ?? null,
           solutionSource: sol?.source ?? null,
           pv: sol?.pv ?? null,
+          aiMove: Boolean(sol?.firstMove && playedMove === sol.firstMove),
         };
       });
       g.allMyMoves = mine;
@@ -4964,32 +5617,47 @@ async function buildPlan(fsClient, uid, args, quizReader) {
       g.analysisError = `ANALYSIS_QUERY_FAILED:${err.message}`;
     } finally {
       analyzedCount++;
-      process.stdout.write(`\rAnalyzed games ${analyzedCount}/${toAnalyze.length}`);
+      if (analyzedCount % 100 === 0 || analyzedCount === toAnalyze.length) {
+        process.stdout.write(`\rAnalyzed games ${analyzedCount}/${toAnalyze.length}`);
+      }
     }
   });
   if (toAnalyze.length) process.stdout.write('\n');
 
-  if (!quizReader) throw new Error('Authenticated AI Sensei browser session is required for rank-aware Quiz curation.');
-  let currentRankPromise = null;
-  const currentRankResolver = () => {
-    currentRankPromise ??= currentOgsRankForAliases(args.me);
-    return currentRankPromise;
+  const currentRankPromises = new Map();
+  const currentRankResolver = identityName => {
+    const aliases = identityName ? [identityName] : args.me;
+    const key = aliases.map(normalizeName).join('|');
+    if (!currentRankPromises.has(key)) {
+      currentRankPromises.set(key, currentOgsRankForAliases(aliases));
+    }
+    return currentRankPromises.get(key);
   };
   const toCurate = toAnalyze.filter(g => !g.analysisError);
-  console.log(`Reading AI Sensei Quiz/rank behavior for ${toCurate.length} games...`);
+  console.log(`Applying AI Sensei frontend-equivalent rank/Quiz policy locally for ${toCurate.length} games...`);
   let curatedCount = 0;
   for (const g of toCurate) {
     try {
       const normalRankInfo = await resolveNormalStudentRank(g, quizReader, args, currentRankResolver);
-      const quiz = await curateGameFromQuiz(g, quizReader, normalRankInfo);
+      const quiz = curateGameLocally(g, normalRankInfo);
+      if (args.validateBrowser) {
+        if (!quizReader) throw new Error('BROWSER_VALIDATION_REQUIRES_AUTHENTICATED_BROWSER');
+        const browserQuiz = await curateGameFromQuiz(g, quizReader, normalRankInfo);
+        assertBrowserCurationMatchesLocal(g.gameId, quiz, browserQuiz);
+      }
       Object.assign(g, quiz);
       g.top3 = quiz.top3;
       g.selection = quiz.selection;
     } catch (err) {
-      g.analysisError = `QUIZ_UI_FAILED:${err.message}`;
+      g.analysisError = `LOCAL_CURATION_FAILED:${err.message}`;
+      const firstLine = String(err?.message ?? err).split('\n', 1)[0];
+      console.warn(`\n  Local rank/Quiz curation failed for ${g.gameId}: ${firstLine}`);
+      if (args.verbose) console.warn(err?.stack ?? err);
     } finally {
       curatedCount++;
-      process.stdout.write(`\rCurated games ${curatedCount}/${toCurate.length}`);
+      if (curatedCount % 100 === 0 || curatedCount === toCurate.length) {
+        process.stdout.write(`\rCurated games ${curatedCount}/${toCurate.length}`);
+      }
     }
   }
   if (toCurate.length) process.stdout.write('\n');
@@ -5329,6 +5997,109 @@ async function writeMemoBackup(plan) {
   return file;
 }
 
+async function writeGameRemovalBackup(fsClient, plan) {
+  if (!plan.gameRemovalTargets.length) return null;
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const file = path.resolve(`games-removal-backup-${stamp}.json`);
+  const primaryNames = [...new Set(plan.gameRemovalTargets.flatMap(target => [
+    target.uploadDocName,
+    target.gameDocName,
+    target.gameNodeDocName,
+    `${FIRESTORE_ROOT}/:analysis/${target.gameId}`,
+  ].filter(Boolean)))];
+  const primaryDocs = await fsClient.batchGetChunked(primaryNames);
+  let completed = 0;
+  const analysisByGame = await mapLimit(plan.gameRemovalTargets, ANALYSIS_CONCURRENCY, async target => {
+    const documents = await fsClient.analysisNodes(target.gameId);
+    completed++;
+    process.stdout.write(`\rBacked up analysis records ${completed}/${plan.gameRemovalTargets.length}`);
+    return { gameId: target.gameId, documents };
+  });
+  if (plan.gameRemovalTargets.length) process.stdout.write('\n');
+  const documents = [
+    ...primaryDocs.values(),
+    ...analysisByGame.flatMap(row => row.documents),
+  ].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  await fs.writeFile(file, JSON.stringify({
+    version: 1,
+    kind: 'ai-sensei-game-removal-backup',
+    generatedAt: new Date().toISOString(),
+    uid: plan.uid,
+    firestoreRoot: FIRESTORE_ROOT,
+    targetCount: plan.gameRemovalTargets.length,
+    documentCount: documents.length,
+    targets: plan.gameRemovalTargets,
+    documents,
+  }, null, 2));
+  return { file, documentCount: documents.length };
+}
+
+async function verifyGameRemovalPreconditions(fsClient, targets) {
+  if (!targets.length) return;
+  const expected = [];
+  for (const target of targets) {
+    for (const [kind, name, updateTime] of [
+      ['upload', target.uploadDocName, target.uploadUpdateTime],
+      ['game', target.gameDocName, target.gameUpdateTime],
+      ['game-node', target.gameNodeDocName, target.gameNodeUpdateTime],
+    ]) {
+      if (name) expected.push({ gameId: target.gameId, kind, name, updateTime });
+    }
+  }
+  const found = await fsClient.batchGetChunked([...new Set(expected.map(row => row.name))]);
+  const problems = [];
+  for (const row of expected) {
+    const current = found.get(row.name);
+    if (!current) {
+      problems.push(`${row.gameId}:${row.kind}:missing`);
+      continue;
+    }
+    if (row.updateTime && current.updateTime !== row.updateTime) {
+      problems.push(`${row.gameId}:${row.kind}:changed`);
+    }
+  }
+  if (problems.length) {
+    throw new Error(`Game-removal precondition check failed for ${problems.slice(0, 12).join(', ')}. Regenerate and review the plan.`);
+  }
+}
+
+async function verifyRemovedGameAccountRecords(fsClient, uid, targets) {
+  if (!targets.length) return;
+  const uploadDocs = await fsClient.allUploads(uid);
+  const uploadIds = new Set(uploadDocs.map(doc => docId(doc.name)));
+  const remainingUploads = targets.filter(target => uploadIds.has(target.gameId)).map(target => target.gameId);
+  const memoDocs = await fsClient.allMemos(uid);
+  const targetIds = new Set(targets.map(target => target.gameId));
+  const remainingMemos = memoDocs.map(parseMemo).filter(memo => memo.gameId && targetIds.has(memo.gameId));
+  if (remainingUploads.length || remainingMemos.length) {
+    throw new Error(
+      `Game-removal verification failed: ${remainingUploads.length} uploads and ${remainingMemos.length} memos remain for removal targets` +
+      `${remainingUploads.length ? ` (${remainingUploads.slice(0, 10).join(', ')})` : ''}.`
+    );
+  }
+}
+
+async function executeGameRemovals(fsClient, quizReader, plan) {
+  if (!plan.gameRemovalTargets.length) return;
+  console.log(`Removing ${plan.gameRemovalTargets.length} reviewed games through AI Sensei's Delete Game UI...`);
+  let done = 0;
+  for (const target of plan.gameRemovalTargets) {
+    // A memo-only historical reference has no account upload record to delete.
+    // Once its memos are removed it disappears from the planner's account history.
+    if (target.uploadDocName) {
+      await quizReader.deleteGameViaUi(target.gameId, { expectedGameName: target.gameName });
+      const stillPresent = await fsClient.batchGet([target.uploadDocName]);
+      if (stillPresent.has(target.uploadDocName)) {
+        throw new Error(`GAME_DELETE_UPLOAD_STILL_PRESENT:${target.gameId}`);
+      }
+    }
+    done++;
+    console.log(`  removed ${done}/${plan.gameRemovalTargets.length}: ${target.gameId}`);
+  }
+  await verifyRemovedGameAccountRecords(fsClient, plan.uid, plan.gameRemovalTargets);
+  console.log('Game-removal verification passed: no target uploads or memos remain in the account history.');
+}
+
 async function loadMemoBackup(file) {
   try {
     return JSON.parse(await fs.readFile(file, 'utf8'));
@@ -5440,7 +6211,7 @@ async function verifySolutionUpdates(fsClient, updates) {
   if (problems.length) throw new Error(`UPDATE verification failed for ${problems.slice(0, 10).join(', ')}`);
 }
 
-async function executePlan(fsClient, plan, hash, confirmHash, args) {
+async function executePlan(fsClient, quizReader, plan, hash, confirmHash, args) {
   if (hash !== confirmHash) {
     die(`Plan hash mismatch. Current plan is ${hash}, but --confirm was ${confirmHash}. Review the newly generated CSV before executing.`);
   }
@@ -5448,8 +6219,18 @@ async function executePlan(fsClient, plan, hash, confirmHash, args) {
     die(`This plan contains ${plan.createMemos.length} CREATE rows. Re-run with --allow-create only after reviewing the current-analysis first-move diagnostic and CREATE rows in cleanup-plan.csv.`);
   }
 
+  if (plan.gameRemovalTargets.length) {
+    console.log('Checking reviewed game-removal document preconditions before any changes...');
+    await verifyGameRemovalPreconditions(fsClient, plan.gameRemovalTargets);
+    console.log('Game-removal preconditions match the reviewed plan.');
+  }
+
   const backup = await writeMemoBackup(plan);
   console.log(`Pre-change memo backup written: ${backup}`);
+  const gameBackup = await writeGameRemovalBackup(fsClient, plan);
+  if (gameBackup) {
+    console.log(`Pre-change game-removal backup written: ${gameBackup.file} (${gameBackup.documentCount} Firestore documents)`);
+  }
 
   if (plan.createMemos.length) {
     console.log(`Creating ${plan.createMemos.length} canonical practice problems before any deletions...`);
@@ -5498,6 +6279,12 @@ async function executePlan(fsClient, plan, hash, confirmHash, args) {
   console.log(`  actual remaining:   ${remainingDocs.length}`);
   if (remainingDocs.length !== expected) throw new Error('Final memo count does not match the reviewed plan. Stop and inspect the backup/audit files.');
   console.log('Verification count matches.');
+
+  if (plan.gameRemovalTargets.length) {
+    console.log('Re-checking game-removal preconditions immediately before deleting games...');
+    await verifyGameRemovalPreconditions(fsClient, plan.gameRemovalTargets);
+    await executeGameRemovals(fsClient, quizReader, plan);
+  }
 }
 
 async function main() {
@@ -5518,7 +6305,7 @@ async function main() {
       await runMemoRestoreStage(fsClient, auth.uid, args);
       return;
     }
-    const quizReader = new AiSenseiQuizReader(auth, auth.uid);
+    const quizReader = new AiSenseiQuizReader(auth, auth.uid, args.verbose);
     const plan = await buildPlan(fsClient, auth.uid, args, quizReader);
     const hash = await writePlan(plan);
     printSummary(plan, hash);
@@ -5532,7 +6319,7 @@ async function main() {
       console.log(`\nDRY RUN ONLY. Nothing was changed.${createNote}\nReviewed-plan command (do not run until validation is complete):\n  node ${shellQuote(scriptName)}${replay ? ` ${replay}` : ''} --execute${plan.createMemos.length ? ' --allow-create' : ''} --confirm ${hash}\n`);
       return;
     }
-    await executePlan(fsClient, plan, hash, args.confirm, args);
+    await executePlan(fsClient, quizReader, plan, hash, args.confirm, args);
   } finally {
     if (auth.externalBrowser) {
       // The importer creates a dedicated upload tab in the user's attached browser; close only

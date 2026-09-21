@@ -6,17 +6,17 @@ Auto AI Sensei grew from a personal cleanup/import script. This document records
 
 For every eligible game, the planner keeps at most one practice problem from the user's own moves.
 
-1. Resolve the normal student rank in this order: game-time SGF/rank metadata, AI Sensei AI Rank Prediction, current OGS rank, then `10k`.
-2. Configure AI Sensei Start Quiz for the user's color with point-loss sorting and Avoid same move enabled.
-3. If the normal rank exposes fewer than three Quiz problems, strengthen one student level at a time and stop at the first level with at least three; if the strongest level still exposes one or two, use those.
-4. Reconcile the Quiz count against analysis and keep the top three distinct first-solution candidates by point loss.
-5. For wins/draws/unknown results, retain only candidates that are still bad at the normal rank. Point mode accepts Inaccuracy/Mistake/Blunder. Win-rate mode counts only Mistake/Blunder as bad. Losses do not require this normal-rank gate.
-6. Rank the remaining candidates by largest positive win-rate loss. If all win-rate losses are zero/unavailable, use point loss. Ties use larger point loss, then earlier move number.
+1. Resolve the normal student rank in this order: game-time SGF/rank metadata, current OGS rank for the exactly identified player identity when available (otherwise the configured aliases), then `10k`. AI Rank Prediction is not used for this decision.
+2. Reproduce AI Sensei's current point-loss mistake classification locally from the stored KataGo `moveInfos`, using the same rank interpolation and Mistake/Blunder thresholds as the frontend.
+3. If the normal rank exposes fewer than three qualifying mistakes, strengthen one Student Level at a time in the same order as the current slider (30k through 8d, then 1p through 9p). Stop at the first level with at least three distinct first-solution mistakes; if the strongest level still exposes one or two, use those. The broken +/- controls are never used.
+4. Keep the top three distinct first-solution candidates by point loss. `--validate-browser` is a validation-only path that drives the real Student Level slider and Quiz UI and fails if live browser curation disagrees with the local result.
+5. If an existing user-side saved problem is one of those top three positions, preserve that position ahead of automatic ranking. For a loss this preservation does not require a normal-rank bad label. For a win/draw/unknown result, preserve it only when point mode still calls it Inaccuracy/Mistake/Blunder or win-rate mode calls it Mistake/Blunder.
+6. If no qualifying existing saved position is preserved, rank the remaining candidates by largest positive win-rate loss. If all win-rate losses are zero/unavailable, use point loss. Ties use larger point loss, then earlier move number.
 7. A loss with zero Quiz problems at the strongest level falls back to the user's worst own move by the same impact ranking.
 
-Exact browser truth is required for rank/Quiz curation. If Quiz count/candidate reconciliation cannot be read, the game fails closed and its existing memos are not mutated.
+The local classifier is intentionally derived from the current AI Sensei frontend semantics so full-library planning does not require thousands of browser round trips. Missing or incomplete `moveInfos` fails closed for that game. Targeted `--validate-browser` runs are used as reconciliation evidence before destructive cleanup.
 
-The accepted solution set is also rank-aware. At the normal rank, take every point-good first move, veto only alternatives that win-rate mode explicitly marks Mistake or Blunder, and always include the KataGo best first move. Store first moves only. If solution enumeration is unreadable, preserve an existing memo unchanged and flag `RETRY_SOLUTION_SYNC`; for a brand-new problem, best-move-only creation is allowed so the position can be retried later.
+The accepted solution set is also rank-aware. At the normal rank, reproduce AI Sensei's current `filter-good-moves` behavior from KataGo `moveInfos`: remove pass, retain alternatives with at least 4% of non-symmetry playouts or one of the first three engine suggestions, take every point-good first move, veto only alternatives that win-rate mode explicitly marks Mistake or Blunder, and always include the KataGo best first move. Store first moves only. If solution enumeration is incomplete, fail closed with `RETRY_SOLUTION_SYNC` rather than silently reducing an existing solution set.
 
 For losses, if the played move is itself in the accepted Good set, remove it when a better Good alternative exists. Try the next-ranked candidate if that leaves no teaching solution. The played move may remain only as the final fallback when it is itself the sole best/acceptable move and no alternative position works.
 
@@ -24,7 +24,7 @@ For losses, if the played move is itself in the accepted Good set, remove it whe
 
 AI Sensei generated game titles are interpreted as `White vs Black`. User aliases are never built into the repository; callers provide them with repeated `--me NAME` arguments.
 
-The planner also recognizes AI Sensei's teaching-game human label as the user's side, and recognizes its normal-game human label only when the opponent clearly looks like an AI/bot. Ambiguous identity is skipped rather than guessed.
+The planner also recognizes AI Sensei's teaching-game human label as the user's side, and recognizes its normal-game human label only when the opponent clearly looks like an AI/bot. Ambiguous or unsupported ownership is never guessed and must end with zero saved problems.
 
 Some imported games do not have a `:games/<id>` document even after analysis completes. For those records only, the planner may recover metadata from a completed `:game-data/<uid>/:uploads/<id>` document and reconstruct the played main line from `:game-data/<uid>/:nodes/<id>`. Recovery requires a usable square board size, both player names, a completed upload status, and a valid node-chain main line. If any of those checks fail, the game remains skipped. Unknown rank marker `?` is treated as absent rank metadata, not as part of a player's identity.
 
@@ -45,6 +45,8 @@ Do not introduce a `+1` offset when refactoring this logic.
 When the selected canonical position is unchanged but its accepted solution set changes, execution performs an in-place `UPDATE` of `:solutions` plus `:updated-at`, guarded by the memo's Firestore `updateTime`. Memo ID, due date, level, variation, upload date, and other training fields are preserved.
 
 When the selected canonical position changes, execution creates and verifies the replacement before deleting the old memo. Deletes use Firestore `updateTime` preconditions. A raw memo backup is written before any mutation. All CREATE/UPDATE verification completes before any superseded memo is deleted.
+
+Games matched exactly to a repeated `--remove-player NAME` target are also removal targets. Their upload/game/node document identities and update times participate in the reviewed plan hash. Execution verifies those preconditions, backs up the known Firestore records, removes all associated saved problems, rechecks the preconditions, then deletes each upload through AI Sensei's own Delete Game UI and verifies that no target upload or memo remains.
 
 ## Memo backup restore
 
