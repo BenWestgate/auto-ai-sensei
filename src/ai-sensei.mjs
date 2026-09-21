@@ -1889,10 +1889,18 @@ class AiSenseiQuizReader {
       await confirmButton.click();
     }
 
-    await Promise.race([
-      page.waitForURL(current => !current.toString().includes(`/game/${this.uid}/${gameId}`), { timeout: 10_000 }),
-      sleep(2_000),
-    ]).catch(() => {});
+    try {
+      // A successful AI Sensei deletion redirects back to the game list only
+      // after its Firestore writes have been issued. Do not race this against
+      // an arbitrary sleep: closing the script-owned tab while those writes are
+      // still in flight can cancel the deletion and leave the upload intact.
+      await page.waitForURL(
+        current => !current.toString().includes(`/game/${this.uid}/${gameId}`),
+        { timeout: 30_000 }
+      );
+    } catch {
+      throw new Error(`GAME_DELETE_UI_DID_NOT_NAVIGATE:${gameId}:${page.url()}`);
+    }
     this.gameId = null;
   }
 
@@ -2646,6 +2654,21 @@ class FirestoreClient {
       return {
         delete: m.docName,
         currentDocument: { updateTime: m.updateTime },
+      };
+    });
+    return this.post(url, { writes });
+  }
+
+  async commitUploadDeletes(targets) {
+    if (!targets.length) return null;
+    const url = `${FIRESTORE_BASE}:commit`;
+    const writes = targets.map(target => {
+      if (!target.uploadDocName || !target.uploadUpdateTime) {
+        throw new Error(`Upload deletion target ${target.gameId ?? '?'} is missing upload document/updateTime`);
+      }
+      return {
+        delete: target.uploadDocName,
+        currentDocument: { updateTime: target.uploadUpdateTime },
       };
     });
     return this.post(url, { writes });
@@ -6079,22 +6102,28 @@ async function verifyRemovedGameAccountRecords(fsClient, uid, targets) {
   }
 }
 
-async function executeGameRemovals(fsClient, quizReader, plan) {
+async function executeGameRemovals(fsClient, plan) {
   if (!plan.gameRemovalTargets.length) return;
-  console.log(`Removing ${plan.gameRemovalTargets.length} reviewed games through AI Sensei's Delete Game UI...`);
+  // AI Sensei's My Games delete-upload action removes the user's
+  // :game-data/{uid}/:uploads/{gameId} document, then marks the row locally
+  // deleted in frontend state. The upload document is the durable account
+  // membership record and is already part of the reviewed plan hash/backup.
+  console.log(`Removing ${plan.gameRemovalTargets.length} reviewed uploaded games using AI Sensei's delete-upload semantics...`);
   let done = 0;
+  const uploadTargets = plan.gameRemovalTargets.filter(target => target.uploadDocName);
+  for (let i = 0; i < uploadTargets.length; i += DELETE_BATCH_SIZE) {
+    const batch = uploadTargets.slice(i, i + DELETE_BATCH_SIZE);
+    await fsClient.commitUploadDeletes(batch);
+    done += batch.length;
+    console.log(`  removed uploaded games ${done}/${uploadTargets.length}`);
+  }
   for (const target of plan.gameRemovalTargets) {
-    // A memo-only historical reference has no account upload record to delete.
-    // Once its memos are removed it disappears from the planner's account history.
     if (target.uploadDocName) {
-      await quizReader.deleteGameViaUi(target.gameId, { expectedGameName: target.gameName });
       const stillPresent = await fsClient.batchGet([target.uploadDocName]);
       if (stillPresent.has(target.uploadDocName)) {
         throw new Error(`GAME_DELETE_UPLOAD_STILL_PRESENT:${target.gameId}`);
       }
     }
-    done++;
-    console.log(`  removed ${done}/${plan.gameRemovalTargets.length}: ${target.gameId}`);
   }
   await verifyRemovedGameAccountRecords(fsClient, plan.uid, plan.gameRemovalTargets);
   console.log('Game-removal verification passed: no target uploads or memos remain in the account history.');
@@ -6283,7 +6312,7 @@ async function executePlan(fsClient, quizReader, plan, hash, confirmHash, args) 
   if (plan.gameRemovalTargets.length) {
     console.log('Re-checking game-removal preconditions immediately before deleting games...');
     await verifyGameRemovalPreconditions(fsClient, plan.gameRemovalTargets);
-    await executeGameRemovals(fsClient, quizReader, plan);
+    await executeGameRemovals(fsClient, plan);
   }
 }
 

@@ -46,7 +46,7 @@ When the selected canonical position is unchanged but its accepted solution set 
 
 When the selected canonical position changes, execution creates and verifies the replacement before deleting the old memo. Deletes use Firestore `updateTime` preconditions. A raw memo backup is written before any mutation. All CREATE/UPDATE verification completes before any superseded memo is deleted.
 
-Games matched exactly to a repeated `--remove-player NAME` target are also removal targets. Their upload/game/node document identities and update times participate in the reviewed plan hash. Execution verifies those preconditions, backs up the known Firestore records, removes all associated saved problems, rechecks the preconditions, then deletes each upload through AI Sensei's own Delete Game UI and verifies that no target upload or memo remains.
+Games matched exactly to a repeated `--remove-player NAME` target are also removal targets. AI Sensei's My Games `delete-upload` action removes the user's `:game-data/{uid}/:uploads/{gameId}` document; the same upload identity and `updateTime` participate in the reviewed plan hash. Execution verifies those preconditions, backs up the known Firestore records, removes all associated saved problems, rechecks the preconditions, then deletes the reviewed upload documents with optimistic `updateTime` preconditions and verifies that no target upload or memo remains.
 
 ## Memo backup restore
 
