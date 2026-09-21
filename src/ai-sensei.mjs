@@ -109,6 +109,19 @@ import {
   splitMemoRestoreActions,
   validateMemoBackup,
 } from './cleanup/memo-backup.mjs';
+import {
+  buildGameRemovalRestorePlan,
+  collectGameRemovalRestoreCandidates,
+  gameRemovalRestoreAudit,
+  restorePreconditionDocumentNames,
+} from './cleanup/game-removal-backup.mjs';
+import {
+  exactPlayersFromGameName,
+  matchingRemovedPlayers,
+  normalizeName,
+  playerColorFromGameName,
+  stripTrailingRank,
+} from './cleanup/identity.mjs';
 import { importedGameMetadataFromUploadFields } from './games/imported-game.mjs';
 import {
   classifyPlannedSmallBoards,
@@ -129,6 +142,7 @@ const PROFILE_DIR = path.resolve('.ai-sensei-playwright-profile');
 const PLAN_JSON = path.resolve('cleanup-plan.json');
 const PLAN_CSV = path.resolve('cleanup-plan.csv');
 const MEMO_RESTORE_PLAN_JSON = path.resolve('memo-restore-plan.json');
+const GAME_REMOVAL_RESTORE_PLAN_JSON = path.resolve('game-removal-restore-plan.json');
 const DELETE_BATCH_SIZE = 200;
 const CREATE_BATCH_SIZE = 100;
 const ANALYSIS_CONCURRENCY = 8;
@@ -211,6 +225,8 @@ function parseArgs(argv) {
     goquestGameCaptureTimeoutMs: GOQUEST_GAME_CAPTURE_TIMEOUT_MS,
     goquestChromiumPath: GOQUEST_DEFAULT_CHROMIUM,
     restoreMemosBackup: null,
+    restoreGameRemovalBackups: [],
+    restorePlayers: [],
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -246,6 +262,8 @@ function parseArgs(argv) {
     else if (a === '--goquest-game-timeout-seconds') out.goquestGameCaptureTimeoutMs = Number(argv[++i]) * 1000;
     else if (a === '--goquest-chromium') out.goquestChromiumPath = path.resolve(argv[++i] ?? GOQUEST_DEFAULT_CHROMIUM);
     else if (a === '--restore-memos-backup') out.restoreMemosBackup = path.resolve(argv[++i] ?? '');
+    else if (a === '--restore-game-removal-backup') out.restoreGameRemovalBackups.push(path.resolve(argv[++i] ?? ''));
+    else if (a === '--restore-player') out.restorePlayers.push(argv[++i] ?? '');
     else if (a === '--help' || a === '-h') {
       console.log(`
 Auto AI Sensei
@@ -253,7 +271,7 @@ Auto AI Sensei
 Optional:
   --me NAME              Identify one of your player names/handles. Repeat as needed.
   --remove-player NAME   Mark games containing this exact player name for removal. Repeat as needed.
-                         These games are never eligible for saved practice problems.
+                         Removal applies only when no --me identity owns either side.
   --execute              Apply the reviewed plan. Without this, dry-run only.
   --allow-create         Required with --execute when the plan contains CREATE rows.
   --confirm HASH         Required with --execute. Use the hash printed by dry-run.
@@ -270,6 +288,13 @@ Memo backup restore (runs instead of cleanup planning):
   --restore-memos-backup PATH
                          Reconcile the live memo library exactly to a raw memos-backup-*.json
                          snapshot. Dry-run by default; use --execute --confirm HASH to apply.
+
+Game-removal backup restore (runs instead of cleanup planning):
+  --restore-game-removal-backup PATH
+                         Restore owned upload-membership records from a games-removal-backup-*.json
+                         snapshot. Repeat for multiple backups.
+  --restore-player NAME  Select a removed player whose games may be restored. Repeat as needed.
+                         A game is restored only when exactly one --me identity owns the other side.
 
 OGS import stage (runs instead of cleanup planning):
   --ogs-import            Discover completed, non-annulled OGS games for the account(s)
@@ -310,6 +335,7 @@ Examples:
   node src/ai-sensei.mjs --cdp http://127.0.0.1:9222 --me YOUR_HANDLE --max-games 20
   node src/ai-sensei.mjs --me YOUR_HANDLE --execute --allow-create --confirm 8ab12cd34ef5
   node src/ai-sensei.mjs --cdp http://127.0.0.1:9222 --restore-memos-backup memos-backup-20260917T220000Z.json
+  node src/ai-sensei.mjs --cdp http://127.0.0.1:9222 --me YOUR_HANDLE --restore-player OTHER_PLAYER --restore-game-removal-backup games-removal-backup-20260917T220000Z.json
   node src/ai-sensei.mjs --cdp http://127.0.0.1:9222 --ogs-import --ogs-account YOUR_OGS_HANDLE --max-ogs-games 20
   node src/ai-sensei.mjs --goquest-import --goquest-account YOUR_GOQUEST_HANDLE
 `);
@@ -321,6 +347,8 @@ Examples:
 
   out.me = [...new Set(out.me.map(s => s.trim()).filter(Boolean))];
   out.removePlayers = [...new Set(out.removePlayers.map(s => s.trim()).filter(Boolean))];
+  out.restoreGameRemovalBackups = [...new Set(out.restoreGameRemovalBackups.filter(Boolean))];
+  out.restorePlayers = [...new Set(out.restorePlayers.map(s => s.trim()).filter(Boolean))];
   out.gameIds = [...new Set(out.gameIds.map(s => s.trim()).filter(Boolean))];
   const myNames = new Set(out.me.map(normalizeName));
   const overlappingRemovedNames = out.removePlayers.filter(name => myNames.has(normalizeName(name)));
@@ -371,8 +399,23 @@ Examples:
   if (out.restoreMemosBackup && (out.ogsImport || out.goquestImport)) {
     die('--restore-memos-backup is a separate stage; do not combine it with import stages.');
   }
+  if (out.restoreGameRemovalBackups.length && (out.ogsImport || out.goquestImport || out.restoreMemosBackup)) {
+    die('--restore-game-removal-backup is a separate stage; do not combine it with imports or memo restore.');
+  }
+  if (out.restoreGameRemovalBackups.length && !out.restorePlayers.length) {
+    die('--restore-game-removal-backup requires at least one --restore-player NAME.');
+  }
+  if (out.restorePlayers.length && !out.restoreGameRemovalBackups.length) {
+    die('--restore-player requires --restore-game-removal-backup PATH.');
+  }
+  if (out.restoreGameRemovalBackups.length && out.removePlayers.length) {
+    die('--restore-game-removal-backup is a separate stage; do not combine it with --remove-player.');
+  }
   if (out.restoreMemosBackup && out.allowCreate) {
     die('--allow-create is a cleanup-only flag and cannot be combined with --restore-memos-backup.');
+  }
+  if (out.restoreGameRemovalBackups.length && out.allowCreate) {
+    die('--allow-create is a cleanup-only flag and cannot be combined with --restore-game-removal-backup.');
   }
   if (out.goquestImport && out.execute) {
     die('--goquest-import is a read-only discovery stage and cannot be combined with cleanup --execute.');
@@ -806,118 +849,6 @@ function parseGameNodeDoc(doc) {
   };
 }
 
-function normalizeName(s) {
-  return String(s ?? '')
-    .normalize('NFKC')
-    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
-}
-
-function isTeachingGameHumanLabel(label) {
-  const s = normalizeName(label);
-  return s.includes('human') && s.includes('teaching game');
-}
-
-function isNormalGameHumanLabel(label) {
-  const s = normalizeName(label);
-  return s.includes('human') && s.includes('normal game');
-}
-
-function isAiPlayerLabel(label) {
-  // AI Sensei-generated AI opponents use labels such as
-  // "AI (Calibrated Rank)" and "Humanlike bot". Match whole words so a
-  // human username containing the letters "ai" is not misclassified.
-  const s = normalizeName(label);
-  return /(^|\s|\()ai(?=\s|\(|$)/i.test(s) || /\bbot\b/i.test(s) || s.includes('calibrated rank');
-}
-
-function stripTrailingRank(label) {
-  let s = normalizeName(label);
-  // AI Sensei game titles can append either a Go rank ("7k", "1d") or a
-  // numeric server rating ("(1671)", "(1891)"). Strip those suffixes only.
-  // Exact matching after suffix removal is important because short aliases
-  // must not substring-match unrelated player names.
-  let prev;
-  do {
-    prev = s;
-    s = s.replace(/\s*(?:\(|\[)?\s*\d+(?:\.\d+)?\s*(?:k|d|p|kyu|dan)\s*(?:\)|\])?\s*$/i, '');
-    s = s.replace(/\s*[\(\[]\s*\d+(?:\.\d+)?\s*[\)\]]\s*$/i, '');
-    // Chinese server rank suffixes, e.g. "player 8级" / "1段".
-    s = s.replace(/\s*\d+(?:\.\d+)?\s*(?:级|段)\s*$/u, '');
-  } while (s !== prev);
-  return s.trim();
-}
-
-function playerColorFromGameName(gameName, myNames) {
-  // AI Sensei's generated title is "White vs Black".
-  const partsRaw = String(gameName).split(/\s+vs\s+/i);
-  if (partsRaw.length !== 2) return { color: null, reason: 'GAME_NAME_NOT_WHITE_VS_BLACK' };
-
-  // User-confirmed convention: in AI Sensei Teaching Games, "Human (Teaching Game)"
-  // is always the user's side.
-  const teachingWhite = isTeachingGameHumanLabel(partsRaw[0]);
-  const teachingBlack = isTeachingGameHumanLabel(partsRaw[1]);
-  if (teachingWhite !== teachingBlack) {
-    return {
-      color: teachingWhite ? 'white' : 'black',
-      reason: teachingWhite ? 'TEACHING_GAME_HUMAN_WHITE' : 'TEACHING_GAME_HUMAN_BLACK',
-    };
-  }
-
-  // User-confirmed convention: "Human (Normal Game)" is also the user's side
-  // when the opponent is an AI/bot. Require the other side to look like an AI
-  // so a generic human-vs-human import with that label is not guessed.
-  const normalWhite = isNormalGameHumanLabel(partsRaw[0]);
-  const normalBlack = isNormalGameHumanLabel(partsRaw[1]);
-  if (normalWhite !== normalBlack) {
-    const otherLooksAi = normalWhite ? isAiPlayerLabel(partsRaw[1]) : isAiPlayerLabel(partsRaw[0]);
-    if (otherLooksAi) {
-      return {
-        color: normalWhite ? 'white' : 'black',
-        reason: normalWhite ? 'NORMAL_GAME_HUMAN_VS_AI_WHITE' : 'NORMAL_GAME_HUMAN_VS_AI_BLACK',
-      };
-    }
-  }
-
-  // Otherwise match the player label exactly after removing only its trailing rank/rating.
-  const [whiteLabel, blackLabel] = partsRaw.map(stripTrailingRank);
-  const aliasesByNormalized = new Map();
-  for (const name of myNames ?? []) {
-    const normalized = normalizeName(name);
-    if (normalized && !aliasesByNormalized.has(normalized)) aliasesByNormalized.set(normalized, name);
-  }
-  const needles = [...aliasesByNormalized.keys()];
-
-  const whiteMatches = needles.filter(n => n === whiteLabel);
-  const blackMatches = needles.filter(n => n === blackLabel);
-
-  if (whiteMatches.length === 1 && blackMatches.length === 0) {
-    return {
-      color: 'white',
-      identityName: aliasesByNormalized.get(whiteMatches[0]) ?? whiteMatches[0],
-      reason: `MATCHED_WHITE:${whiteMatches[0]}`,
-    };
-  }
-  if (blackMatches.length === 1 && whiteMatches.length === 0) {
-    return {
-      color: 'black',
-      identityName: aliasesByNormalized.get(blackMatches[0]) ?? blackMatches[0],
-      reason: `MATCHED_BLACK:${blackMatches[0]}`,
-    };
-  }
-  if (isAiPlayerLabel(partsRaw[0]) && isAiPlayerLabel(partsRaw[1])) {
-    return { color: null, reason: 'NO_USER_SIDE_AI_VS_AI', whiteLabel, blackLabel };
-  }
-  return {
-    color: null,
-    reason: 'PLAYER_NAME_AMBIGUOUS_OR_NOT_FOUND',
-    whiteLabel,
-    blackLabel,
-  };
-}
-
 function rankFromPlayerLabel(label) {
   const m = String(label ?? '').normalize('NFKC').trim().match(/(?:^|\s|\(|\[)(\d{1,2}\s*(?:k|q|kyu|d|dan|dm|p|pro))\s*(?:\)|\])?\s*$/i);
   return m ? normalizeStudentRank(m[1]) : null;
@@ -962,18 +893,6 @@ function ogsRankFromPlayerRow(row) {
   if (ranking <= 29) return `${30 - ranking}k`;
   const dan = ranking - 29;
   return dan >= 1 && dan <= 9 ? `${dan}d` : null;
-}
-
-function exactPlayersFromGameName(gameName) {
-  const parts = String(gameName).split(/\s+vs\s+/i);
-  if (parts.length !== 2) return [];
-  return parts.map(stripTrailingRank).filter(Boolean);
-}
-
-function matchingRemovedPlayers(gameName, removePlayers) {
-  if (!removePlayers?.length) return [];
-  const players = new Set(exactPlayersFromGameName(gameName));
-  return removePlayers.filter(name => players.has(normalizeName(name)));
 }
 
 function inferAlternatingColorMap(game, gameNodes) {
@@ -2669,6 +2588,24 @@ class FirestoreClient {
       return {
         delete: target.uploadDocName,
         currentDocument: { updateTime: target.uploadUpdateTime },
+      };
+    });
+    return this.post(url, { writes });
+  }
+
+  async commitUploadRestores(actions) {
+    if (!actions.length) return null;
+    const url = `${FIRESTORE_BASE}:commit`;
+    const writes = actions.map(row => {
+      if (row.action !== 'RESTORE_UPLOAD' || !row.target?.uploadDocName || !row.desiredUpload?.fields) {
+        throw new Error(`Invalid upload restore action for ${row.gameId ?? '?'}`);
+      }
+      return {
+        update: {
+          name: row.target.uploadDocName,
+          fields: row.desiredUpload.fields,
+        },
+        currentDocument: { exists: false },
       };
     });
     return this.post(url, { writes });
@@ -5490,8 +5427,9 @@ async function buildPlan(fsClient, uid, args, quizReader) {
         continue;
       }
     }
+    const who = playerColorFromGameName(game.name, args.me);
     const matchedRemovedPlayers = matchingRemovedPlayers(game.name, args.removePlayers);
-    if (matchedRemovedPlayers.length) {
+    if (!who.color && matchedRemovedPlayers.length) {
       const uploadDoc = uploadDocsById.get(gameId) ?? null;
       gameRemovalTargets.push({
         gameId,
@@ -5510,7 +5448,6 @@ async function buildPlan(fsClient, uid, args, quizReader) {
       });
       continue;
     }
-    const who = playerColorFromGameName(game.name, args.me);
     if (!who.color) {
       prepared.push({ gameId, gameMemos, game, gameNodes, myColor: null, fatal: who.reason });
       continue;
@@ -6137,6 +6074,90 @@ async function loadMemoBackup(file) {
   }
 }
 
+async function runGameRemovalRestoreStage(fsClient, uid, args) {
+  const backups = [];
+  for (const file of args.restoreGameRemovalBackups) {
+    try {
+      backups.push({ source: file, backup: JSON.parse(await fs.readFile(file, 'utf8')) });
+    } catch (err) {
+      throw new Error(`Could not read game-removal backup ${file}: ${err.message}`);
+    }
+  }
+  const selection = collectGameRemovalRestoreCandidates(backups, {
+    firestoreRoot: FIRESTORE_ROOT,
+    uid,
+    myNames: args.me,
+    restorePlayers: args.restorePlayers,
+  });
+  const preconditionNames = restorePreconditionDocumentNames(selection);
+  const current = await fsClient.batchGetChunked(preconditionNames);
+  const plan = buildGameRemovalRestorePlan(selection, current);
+  await fs.writeFile(GAME_REMOVAL_RESTORE_PLAN_JSON, JSON.stringify({
+    backupFiles: args.restoreGameRemovalBackups,
+    restorePlayers: args.restorePlayers,
+    ...gameRemovalRestoreAudit(plan),
+  }, null, 2));
+
+  const byIdentity = new Map();
+  for (const row of plan.actions) byIdentity.set(row.identityName, (byIdentity.get(row.identityName) ?? 0) + 1);
+  const foreignSkipped = plan.skipped.filter(row => row.reason === 'FOREIGN_OR_AMBIGUOUS_GAME').length;
+  console.log('\nGAME-REMOVAL RESTORE PLAN');
+  console.log(`  backup removal targets: ${plan.targetCount}`);
+  console.log(`  owned uploads to restore: ${plan.restoreCount}`);
+  for (const [identity, count] of [...byIdentity].sort((a, b) => a[0].localeCompare(b[0]))) {
+    console.log(`    ${identity}: ${count}`);
+  }
+  console.log(`  foreign/ambiguous left removed: ${foreignSkipped}`);
+  console.log(`  other unselected targets: ${plan.skippedCount - foreignSkipped}`);
+  console.log(`  plan hash: ${plan.planHash}`);
+  console.log(`  audit file: ${GAME_REMOVAL_RESTORE_PLAN_JSON}`);
+
+  if (!args.execute) {
+    const scriptName = invokedScriptPath();
+    const authArgs = args.cdpUrl
+      ? ` --cdp ${shellQuote(args.cdpUrl)}`
+      : `${args.headless ? ' --headless' : ''}${path.resolve(args.profileDir) !== PROFILE_DIR ? ` --profile-dir ${shellQuote(args.profileDir)}` : ''}`;
+    const identityArgs = args.me.map(name => ` --me ${shellQuote(name)}`).join('');
+    const playerArgs = args.restorePlayers.map(name => ` --restore-player ${shellQuote(name)}`).join('');
+    const backupArgs = args.restoreGameRemovalBackups.map(file => ` --restore-game-removal-backup ${shellQuote(file)}`).join('');
+    console.log(`\nDRY RUN ONLY. Nothing was changed.\nReviewed restore command:\n  node ${shellQuote(scriptName)}${authArgs}${identityArgs}${playerArgs}${backupArgs} --execute --confirm ${plan.planHash}\n`);
+    return;
+  }
+  if (args.confirm !== plan.planHash) {
+    die(`Game-removal restore hash mismatch. Current restore plan is ${plan.planHash}, but --confirm was ${args.confirm}. Review the regenerated restore plan before executing.`);
+  }
+
+  console.log('Re-checking all restore preconditions immediately before creating upload records...');
+  const fresh = await fsClient.batchGetChunked(preconditionNames);
+  const freshPlan = buildGameRemovalRestorePlan(selection, fresh);
+  if (freshPlan.planHash !== plan.planHash) throw new Error('Game-removal restore plan changed before execution; regenerate and review it.');
+
+  console.log(`Restoring ${plan.restoreCount} owned upload records with exists:false preconditions...`);
+  for (let i = 0; i < plan.actions.length; i += CREATE_BATCH_SIZE) {
+    const batch = plan.actions.slice(i, i + CREATE_BATCH_SIZE);
+    await fsClient.commitUploadRestores(batch);
+    console.log(`  restored ${Math.min(i + batch.length, plan.actions.length)}/${plan.actions.length}`);
+  }
+
+  const restored = await fsClient.batchGetChunked(plan.actions.map(row => row.target.uploadDocName));
+  const restoreProblems = [];
+  for (const row of plan.actions) {
+    const doc = restored.get(row.target.uploadDocName);
+    if (!doc) restoreProblems.push(`${row.gameId}:missing`);
+    else if (stableJsonSha256(doc.fields) !== stableJsonSha256(row.desiredUpload.fields)) restoreProblems.push(`${row.gameId}:field-mismatch`);
+  }
+  if (restoreProblems.length) throw new Error(`Game-removal restore verification failed for ${restoreProblems.slice(0, 12).join(', ')}`);
+
+  const foreignNames = plan.skipped
+    .filter(row => row.reason === 'FOREIGN_OR_AMBIGUOUS_GAME' && row.uploadDocName)
+    .map(row => row.uploadDocName);
+  const foreignPresent = foreignNames.length ? await fsClient.batchGetChunked(foreignNames) : new Map();
+  if (foreignPresent.size) {
+    throw new Error(`Game-removal restore verification failed: ${foreignPresent.size} foreign/ambiguous upload records are present.`);
+  }
+  console.log(`Game-removal restore verified: ${plan.restoreCount} owned uploads restored; ${foreignSkipped} foreign/ambiguous uploads remain removed.`);
+}
+
 async function runMemoRestoreStage(fsClient, uid, args) {
   const backup = await loadMemoBackup(args.restoreMemosBackup);
   validateMemoBackup(backup, { firestoreRoot: FIRESTORE_ROOT, uid });
@@ -6328,6 +6349,10 @@ async function main() {
     const fsClient = new FirestoreClient(auth);
     if (args.ogsImport) {
       await runOgsImportStage(auth, fsClient, args);
+      return;
+    }
+    if (args.restoreGameRemovalBackups.length) {
+      await runGameRemovalRestoreStage(fsClient, auth.uid, args);
       return;
     }
     if (args.restoreMemosBackup) {

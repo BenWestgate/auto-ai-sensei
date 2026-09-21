@@ -23,6 +23,8 @@ test('--help is generic and contains no personal account defaults', () => {
   assert.match(source, /--ogs-account NAME/);
   assert.match(source, /--goquest-account NAME/);
   assert.match(source, /--restore-memos-backup PATH/);
+  assert.match(source, /--restore-game-removal-backup PATH/);
+  assert.match(source, /--restore-player NAME/);
   assert.match(source, /const DEFAULT_PLAYER_NAMES = Object\.freeze\(\[\]\);/);
   assert.match(source, /const DEFAULT_OGS_ACCOUNTS = Object\.freeze\(\[\]\);/);
   assert.match(source, /const DEFAULT_GOQUEST_ACCOUNTS = Object\.freeze\(\[\]\);/);
