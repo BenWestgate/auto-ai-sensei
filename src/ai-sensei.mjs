@@ -110,6 +110,14 @@ import {
   validateMemoBackup,
 } from './cleanup/memo-backup.mjs';
 import {
+  acceptedFirstMovesFromSolutions,
+  firestoreSolutionsForFirstMoves,
+  fullSolutionKeyFromSolutions,
+  hasExactFirstMoveSolutionEncoding,
+  normalizeSolutionMove,
+  solutionKeyFromSolutions,
+} from './cleanup/solutions.mjs';
+import {
   buildGameRemovalRestorePlan,
   collectGameRemovalRestoreCandidates,
   gameRemovalRestoreAudit,
@@ -520,53 +528,6 @@ function docId(docName) {
   return String(docName).split('/').at(-1);
 }
 
-function normalizeSolutionMove(v) {
-  if (v == null) return null;
-  const s = String(v).trim().toLowerCase();
-  // AI Sensei / SGF encodes pass as an empty coordinate.
-  return s === '' ? '<pass>' : s;
-}
-
-function canonicalSolutionEntries(solutions) {
-  if (!solutions || typeof solutions !== 'object' || Array.isArray(solutions)) return [];
-  const keys = Object.keys(solutions).sort((a, b) => {
-    const ai = /^\d+$/.test(a) ? Number(a) : Number.POSITIVE_INFINITY;
-    const bi = /^\d+$/.test(b) ? Number(b) : Number.POSITIVE_INFINITY;
-    return ai !== bi ? ai - bi : a.localeCompare(b);
-  });
-  return keys.map(k => {
-    const raw = solutions[k];
-    const moves = Array.isArray(raw)
-      ? raw.map(normalizeSolutionMove).filter(v => v != null)
-      : [];
-    return [String(k), moves];
-  });
-}
-
-function primarySolutionMoves(solutions) {
-  const first = canonicalSolutionEntries(solutions).find(([k]) => k === '0');
-  if (!first) return [];
-  // Key the AI Sensei "Avoid same move" behavior by the move(s) accepted at the
-  // FIRST ply of the solution. Later reply moves do not make it a different
-  // "same move" problem. Sort/dedupe so Firestore array ordering cannot matter.
-  return [...new Set(first[1])].sort();
-}
-
-function fullSolutionKeyFromSolutions(solutions) {
-  const entries = canonicalSolutionEntries(solutions);
-  if (!entries.length || entries.every(([, moves]) => moves.length === 0)) return null;
-  return entries.map(([k, moves]) => `${k}=${moves.join('>')}`).join(';');
-}
-
-function solutionKeyFromSolutions(solutions) {
-  const firstMoves = primarySolutionMoves(solutions);
-  if (!firstMoves.length) return null;
-  // User-confirmed AI Sensei semantics: "same move" means the same solution move
-  // recurring at different turns (for example, both players repeatedly miss the
-  // same critical play). Only the first solution ply defines the de-duplication key.
-  return `first=${firstMoves.join('|')}`;
-}
-
 function parseMemo(doc) {
   const f = decodeFsFields(doc.fields);
   const solutions = f[':solutions'] ?? null;
@@ -578,7 +539,7 @@ function parseMemo(doc) {
     level: Number.isFinite(f[':level']) ? Number(f[':level']) : 0,
     variation: f[':variation'] ?? [],
     solutions,
-    primarySolutionMoves: primarySolutionMoves(solutions),
+    primarySolutionMoves: acceptedFirstMovesFromSolutions(solutions),
     solutionKey: solutionKeyFromSolutions(solutions),
     fullSolutionKey: fullSolutionKeyFromSolutions(solutions),
     uploadDate: f[':upload-date'] ?? null,
@@ -4848,22 +4809,6 @@ function deterministicBackfillMemoId(uid, gameId, moveNumber) {
   return 'B' + crypto.createHash('sha256').update(`${uid}\0${gameId}\0${moveNumber}`).digest('hex').slice(0, 19);
 }
 
-function firestoreSolutionString(move) {
-  return move === '<pass>' ? '' : move;
-}
-
-function firestoreSolutionsForFirstMoves(moves) {
-  const unique = [...new Set((moves ?? []).map(normalizeSolutionMove).filter(Boolean))].sort();
-  if (!unique.length) throw new Error('Cannot encode an empty solution set.');
-  return {
-    mapValue: {
-      fields: {
-        '0': { arrayValue: { values: unique.map(move => ({ stringValue: firestoreSolutionString(move) })) } },
-      },
-    },
-  };
-}
-
 function initialDueDate(now) {
   const hour = 60 * 60 * 1000;
   const t = now.getTime() + hour;
@@ -6239,7 +6184,7 @@ async function verifyCreates(fsClient, creates, uid) {
     const doc = found.get(name);
     if (!doc) { problems.push(`${c.gameId}@${c.moveNumber}:missing`); continue; }
     const m = parseMemo(doc);
-    if (m.gameId !== c.gameId || m.moveNumber !== c.moveNumber || !sameMoveSet(m.primarySolutionMoves, c.solutionMoves)) {
+    if (m.gameId !== c.gameId || m.moveNumber !== c.moveNumber || !hasExactFirstMoveSolutionEncoding(m.solutions, c.solutionMoves)) {
       problems.push(`${c.gameId}@${c.moveNumber}:field-mismatch`);
     }
   }
@@ -6254,7 +6199,7 @@ async function verifySolutionUpdates(fsClient, updates) {
     const doc = found.get(u.docName);
     if (!doc) { problems.push(`${u.gameId}@${u.moveNumber}:missing`); continue; }
     const m = parseMemo(doc);
-    if (m.gameId !== u.gameId || m.moveNumber !== u.moveNumber || !sameMoveSet(m.primarySolutionMoves, u.solutionMoves)) {
+    if (m.gameId !== u.gameId || m.moveNumber !== u.moveNumber || !hasExactFirstMoveSolutionEncoding(m.solutions, u.solutionMoves)) {
       problems.push(`${u.gameId}@${u.moveNumber}:field-mismatch`);
     }
   }
