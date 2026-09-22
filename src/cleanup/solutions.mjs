@@ -73,3 +73,20 @@ export function hasExactFirstMoveSolutionEncoding(solutions, desiredMoves) {
   }
   return true;
 }
+
+export function hasExactFirestoreFirstMoveSolutionEncoding(value, desiredMoves) {
+  const desired = [...new Set((desiredMoves ?? []).map(normalizeSolutionMove).filter(Boolean))].sort();
+  if (!desired.length) return false;
+  const fields = value?.mapValue?.fields;
+  if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return false;
+  const keys = Object.keys(fields).sort((a, b) => Number(a) - Number(b));
+  if (keys.length !== desired.length) return false;
+  for (let i = 0; i < desired.length; i++) {
+    const key = String(i);
+    if (keys[i] !== key) return false;
+    const values = fields[key]?.arrayValue?.values;
+    if (!Array.isArray(values) || values.length !== 1) return false;
+    if (normalizeSolutionMove(values[0]?.stringValue) !== desired[i]) return false;
+  }
+  return true;
+}

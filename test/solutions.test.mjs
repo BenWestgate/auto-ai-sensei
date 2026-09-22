@@ -4,6 +4,7 @@ import {
   acceptedFirstMovesFromSolutions,
   firestoreSolutionsForFirstMoves,
   hasExactFirstMoveSolutionEncoding,
+  hasExactFirestoreFirstMoveSolutionEncoding,
   solutionKeyFromSolutions,
 } from '../src/cleanup/solutions.mjs';
 
@@ -34,6 +35,21 @@ test('writer emits one numbered one-move solution line per accepted first move',
 test('exact verifier rejects old malformed one-line encoding', () => {
   assert.equal(hasExactFirstMoveSolutionEncoding({ '0': ['ab', 'ac', 'cc'] }, ['ab', 'ac', 'cc']), false);
   assert.equal(hasExactFirstMoveSolutionEncoding({ '0': ['ab'], '1': ['ac'], '2': ['cc'] }, ['ab', 'ac', 'cc']), true);
+});
+
+test('raw Firestore verifier independently rejects packed alternatives', () => {
+  const correct = firestoreSolutionsForFirstMoves(['ab', 'ac', 'cc']);
+  const malformed = {
+    mapValue: {
+      fields: {
+        '0': { arrayValue: { values: [
+          { stringValue: 'ab' }, { stringValue: 'ac' }, { stringValue: 'cc' },
+        ] } },
+      },
+    },
+  };
+  assert.equal(hasExactFirestoreFirstMoveSolutionEncoding(correct, ['ab', 'ac', 'cc']), true);
+  assert.equal(hasExactFirestoreFirstMoveSolutionEncoding(malformed, ['ab', 'ac', 'cc']), false);
 });
 
 test('pass is normalized consistently in parser, writer, and verifier', () => {

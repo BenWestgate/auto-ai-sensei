@@ -114,6 +114,7 @@ import {
   firestoreSolutionsForFirstMoves,
   fullSolutionKeyFromSolutions,
   hasExactFirstMoveSolutionEncoding,
+  hasExactFirestoreFirstMoveSolutionEncoding,
   normalizeSolutionMove,
   solutionKeyFromSolutions,
 } from './cleanup/solutions.mjs';
@@ -235,6 +236,7 @@ function parseArgs(argv) {
     restoreMemosBackup: null,
     restoreGameRemovalBackups: [],
     restorePlayers: [],
+    repairSolutionsPlan: null,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -272,6 +274,7 @@ function parseArgs(argv) {
     else if (a === '--restore-memos-backup') out.restoreMemosBackup = path.resolve(argv[++i] ?? '');
     else if (a === '--restore-game-removal-backup') out.restoreGameRemovalBackups.push(path.resolve(argv[++i] ?? ''));
     else if (a === '--restore-player') out.restorePlayers.push(argv[++i] ?? '');
+    else if (a === '--repair-solutions-plan') out.repairSolutionsPlan = path.resolve(argv[++i] ?? '');
     else if (a === '--help' || a === '-h') {
       console.log(`
 Auto AI Sensei
@@ -296,6 +299,12 @@ Memo backup restore (runs instead of cleanup planning):
   --restore-memos-backup PATH
                          Reconcile the live memo library exactly to a raw memos-backup-*.json
                          snapshot. Dry-run by default; use --execute --confirm HASH to apply.
+
+Solution-only repair (runs instead of cleanup planning):
+  --repair-solutions-plan PATH
+                         Apply only UPDATE rows from a reviewed cleanup-plan.json.
+                         Refuses any plan with CREATE/DELETE/SKIP/game-removal rows and
+                         requires --confirm HASH. Writes only :solutions + :updated-at.
 
 Game-removal backup restore (runs instead of cleanup planning):
   --restore-game-removal-backup PATH
@@ -369,7 +378,7 @@ Examples:
   out.ogsAccounts = [...new Set(out.ogsAccounts.map(s => s.trim()).filter(Boolean))];
   out.goquestAccounts = [...new Set(out.goquestAccounts.map(s => s.trim()).filter(Boolean))];
   out.goquestGtypes = [...new Set(out.goquestGtypes.map(s => s.trim().toLowerCase()).filter(Boolean))];
-  if (!out.ogsImport && !out.goquestImport && !out.restoreMemosBackup && !out.me.length) {
+  if (!out.ogsImport && !out.goquestImport && !out.restoreMemosBackup && !out.repairSolutionsPlan && !out.me.length) {
     die('cleanup requires at least one --me NAME so your moves can be identified safely.');
   }
   if (out.maxOgsGames !== null && (!Number.isFinite(out.maxOgsGames) || out.maxOgsGames <= 0)) {
@@ -409,6 +418,15 @@ Examples:
   }
   if (out.restoreGameRemovalBackups.length && (out.ogsImport || out.goquestImport || out.restoreMemosBackup)) {
     die('--restore-game-removal-backup is a separate stage; do not combine it with imports or memo restore.');
+  }
+  if (out.repairSolutionsPlan && (out.ogsImport || out.goquestImport || out.restoreMemosBackup || out.restoreGameRemovalBackups.length)) {
+    die('--repair-solutions-plan is a separate stage; do not combine it with imports or restore stages.');
+  }
+  if (out.repairSolutionsPlan && (out.execute || out.allowCreate || out.removePlayers.length)) {
+    die('--repair-solutions-plan cannot be combined with cleanup mutation flags or --remove-player.');
+  }
+  if (out.repairSolutionsPlan && !out.confirm) {
+    die('--repair-solutions-plan requires --confirm HASH from the reviewed cleanup plan.');
   }
   if (out.restoreGameRemovalBackups.length && !out.restorePlayers.length) {
     die('--restore-game-removal-backup requires at least one --restore-player NAME.');
@@ -6206,6 +6224,104 @@ async function verifySolutionUpdates(fsClient, updates) {
   if (problems.length) throw new Error(`UPDATE verification failed for ${problems.slice(0, 10).join(', ')}`);
 }
 
+async function runSolutionRepairStage(fsClient, uid, args) {
+  const planFile = args.repairSolutionsPlan;
+  const reviewed = JSON.parse(await fs.readFile(planFile, 'utf8'));
+  const computedHash = stablePlanHash(reviewed.rows ?? [], reviewed.gameRemovalTargets ?? []);
+  if (!reviewed.planHash || reviewed.planHash !== computedHash || args.confirm !== computedHash) {
+    die(`Solution repair plan hash mismatch. File/computed/confirmed hashes are ${reviewed.planHash ?? 'missing'} / ${computedHash} / ${args.confirm ?? 'missing'}.`);
+  }
+  const unsafeCounts = {
+    create: Number(reviewed.createCount ?? 0),
+    delete: Number(reviewed.deleteCount ?? 0),
+    skip: Number(reviewed.skipCount ?? 0),
+    gameRemoval: Number(reviewed.gameRemovalCount ?? 0),
+  };
+  if (Object.values(unsafeCounts).some(n => n !== 0)) {
+    die(`Solution repair refuses this plan: CREATE=${unsafeCounts.create}, DELETE=${unsafeCounts.delete}, SKIP=${unsafeCounts.skip}, game-removal=${unsafeCounts.gameRemoval}.`);
+  }
+  const allowedActions = new Set(['KEEP', 'UPDATE', 'NONE']);
+  const badAction = (reviewed.rows ?? []).find(row => !allowedActions.has(row.action));
+  if (badAction) die(`Solution repair refuses unexpected action ${badAction.action} for ${badAction.gameId ?? '?'}.`);
+
+  const updateRows = (reviewed.rows ?? []).filter(row => row.action === 'UPDATE');
+  if (updateRows.length !== Number(reviewed.updateCount ?? -1)) {
+    die(`Solution repair update-count mismatch: summary=${reviewed.updateCount}, rows=${updateRows.length}.`);
+  }
+  if (!updateRows.length) {
+    console.log('Reviewed plan has no solution updates; nothing to repair.');
+    return;
+  }
+  const updates = updateRows.map(row => {
+    const moves = canonicalMoveSet(String(row.solutionMoves ?? '').split('|'));
+    if (!row.memoId || !row.gameId || !Number.isInteger(Number(row.moveNumber)) || !row.updateTime || !moves.length) {
+      throw new Error(`Invalid solution repair row for ${row.gameId ?? '?'} / ${row.memoId ?? '?'}.`);
+    }
+    return {
+      memoId: row.memoId,
+      docName: `${FIRESTORE_ROOT}/:users/${uid}/:memos/${row.memoId}`,
+      updateTime: row.updateTime,
+      gameId: row.gameId,
+      moveNumber: Number(row.moveNumber),
+      solutionMoves: moves,
+    };
+  });
+  if (new Set(updates.map(row => row.docName)).size !== updates.length) {
+    die('Solution repair refuses duplicate memo targets.');
+  }
+
+  console.log(`Preflighting ${updates.length} solution-only updates from ${planFile}...`);
+  const preflight = await fsClient.batchGetChunked(updates.map(row => row.docName));
+  const problems = [];
+  for (const update of updates) {
+    const doc = preflight.get(update.docName);
+    if (!doc) { problems.push(`${update.memoId}:missing`); continue; }
+    if (doc.updateTime !== update.updateTime) { problems.push(`${update.memoId}:changed`); continue; }
+    const fields = decodeFsFields(doc.fields);
+    if (fields[':game-id'] !== update.gameId || fields[':move-number'] !== update.moveNumber) {
+      problems.push(`${update.memoId}:identity-mismatch`);
+    }
+  }
+  if (problems.length) throw new Error(`Solution repair preflight failed for ${problems.slice(0, 12).join(', ')}.`);
+
+  const currentDocs = await fsClient.allMemos(uid);
+  if (currentDocs.length !== Number(reviewed.problemCount ?? -1)) {
+    throw new Error(`Solution repair halted: reviewed memo count ${reviewed.problemCount} != live ${currentDocs.length}.`);
+  }
+  const backup = await writeMemoBackup({ uid, rawMemoDocs: currentDocs });
+  console.log(`Pre-change memo backup written: ${backup}`);
+
+  console.log(`Updating :solutions in place for ${updates.length} canonical problems...`);
+  for (let i = 0; i < updates.length; i += CREATE_BATCH_SIZE) {
+    const batch = updates.slice(i, i + CREATE_BATCH_SIZE);
+    await fsClient.commitSolutionUpdates(batch);
+    console.log(`  updated ${Math.min(i + batch.length, updates.length)}/${updates.length}`);
+  }
+
+  console.log('Verifying raw Firestore solution-line encoding...');
+  const verified = await fsClient.batchGetChunked(updates.map(row => row.docName));
+  const verifyProblems = [];
+  for (const update of updates) {
+    const doc = verified.get(update.docName);
+    if (!doc) { verifyProblems.push(`${update.memoId}:missing`); continue; }
+    const fields = decodeFsFields(doc.fields);
+    if (fields[':game-id'] !== update.gameId || fields[':move-number'] !== update.moveNumber) {
+      verifyProblems.push(`${update.memoId}:identity-mismatch`);
+      continue;
+    }
+    if (!hasExactFirestoreFirstMoveSolutionEncoding(doc.fields?.[':solutions'], update.solutionMoves)) {
+      verifyProblems.push(`${update.memoId}:raw-solution-shape`);
+    }
+  }
+  if (verifyProblems.length) throw new Error(`Solution repair verification failed for ${verifyProblems.slice(0, 12).join(', ')}.`);
+
+  const finalDocs = await fsClient.allMemos(uid);
+  if (finalDocs.length !== currentDocs.length) {
+    throw new Error(`Solution repair changed memo count: before=${currentDocs.length}, after=${finalDocs.length}.`);
+  }
+  console.log(`Solution repair verified: ${updates.length} memos have exact separate-line encoding; memo count remains ${finalDocs.length}.`);
+}
+
 async function executePlan(fsClient, quizReader, plan, hash, confirmHash, args) {
   if (hash !== confirmHash) {
     die(`Plan hash mismatch. Current plan is ${hash}, but --confirm was ${confirmHash}. Review the newly generated CSV before executing.`);
@@ -6302,6 +6418,10 @@ async function main() {
     }
     if (args.restoreMemosBackup) {
       await runMemoRestoreStage(fsClient, auth.uid, args);
+      return;
+    }
+    if (args.repairSolutionsPlan) {
+      await runSolutionRepairStage(fsClient, auth.uid, args);
       return;
     }
     const quizReader = new AiSenseiQuizReader(auth, auth.uid, args.verbose);
