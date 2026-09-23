@@ -11,10 +11,12 @@
  *     stored KataGo moveInfos and strengthen Student Level one slider step at a time
  *     until three distinct first-solution mistakes are available (or the range ends).
  *   - Take the top 3 distinct mistakes by point loss.
- *   - Preserve an existing user-selected position when policy allows it; otherwise
+ *   - Preserve an existing user-selected position whenever it is still among the
+ *     top three distinct point-loss mistakes; otherwise
  *     prefer larger positive win-rate drop, then point loss, then earlier move number.
- *   - Wins/draws/unknown require the selected position to remain bad at normal rank;
- *     losses preserve a remembered top-three position even if it is now normal-rank good.
+ *   - For a new position, wins/draws/unknown require the selected position to remain bad
+ *     at normal rank. A remembered top-three position is preserved regardless, so training
+ *     history is not discarded merely because current thresholds changed.
  *   - Ambiguous/unsupported ownership must end with zero saved problems.
  *
  * Full-history discovery:
@@ -237,6 +239,7 @@ function parseArgs(argv) {
     restoreGameRemovalBackups: [],
     restorePlayers: [],
     repairSolutionsPlan: null,
+    selfTest: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -275,6 +278,7 @@ function parseArgs(argv) {
     else if (a === '--restore-game-removal-backup') out.restoreGameRemovalBackups.push(path.resolve(argv[++i] ?? ''));
     else if (a === '--restore-player') out.restorePlayers.push(argv[++i] ?? '');
     else if (a === '--repair-solutions-plan') out.repairSolutionsPlan = path.resolve(argv[++i] ?? '');
+    else if (a === '--self-test') out.selfTest = true;
     else if (a === '--help' || a === '-h') {
       console.log(`
 Auto AI Sensei
@@ -294,6 +298,8 @@ Optional:
                          Recommended when Google blocks automated sign-in.
   --headless             Only works after the Playwright profile is already logged in.
   --verbose              Print additional schema-detection details.
+  --self-test            Check Node.js, browser/login, Firestore access, and the current
+                         AI Sensei memo/upload schema, then exit without planning changes.
 
 Memo backup restore (runs instead of cleanup planning):
   --restore-memos-backup PATH
@@ -378,7 +384,7 @@ Examples:
   out.ogsAccounts = [...new Set(out.ogsAccounts.map(s => s.trim()).filter(Boolean))];
   out.goquestAccounts = [...new Set(out.goquestAccounts.map(s => s.trim()).filter(Boolean))];
   out.goquestGtypes = [...new Set(out.goquestGtypes.map(s => s.trim().toLowerCase()).filter(Boolean))];
-  if (!out.ogsImport && !out.goquestImport && !out.restoreMemosBackup && !out.repairSolutionsPlan && !out.me.length) {
+  if (!out.ogsImport && !out.goquestImport && !out.restoreMemosBackup && !out.repairSolutionsPlan && !out.selfTest && !out.me.length) {
     die('cleanup requires at least one --me NAME so your moves can be identified safely.');
   }
   if (out.maxOgsGames !== null && (!Number.isFinite(out.maxOgsGames) || out.maxOgsGames <= 0)) {
@@ -421,6 +427,12 @@ Examples:
   }
   if (out.repairSolutionsPlan && (out.ogsImport || out.goquestImport || out.restoreMemosBackup || out.restoreGameRemovalBackups.length)) {
     die('--repair-solutions-plan is a separate stage; do not combine it with imports or restore stages.');
+  }
+  if (out.selfTest && (out.ogsImport || out.goquestImport || out.restoreMemosBackup || out.restoreGameRemovalBackups.length || out.repairSolutionsPlan)) {
+    die('--self-test is a separate stage; do not combine it with imports, cleanup repair, or restore stages.');
+  }
+  if (out.selfTest && (out.execute || out.allowCreate || out.allowOgsUpload || out.confirmOgs || out.removePlayers.length)) {
+    die('--self-test is read-only and cannot be combined with mutation/removal flags.');
   }
   if (out.repairSolutionsPlan && (out.execute || out.allowCreate || out.removePlayers.length)) {
     die('--repair-solutions-plan cannot be combined with cleanup mutation flags or --remove-player.');
@@ -2403,6 +2415,58 @@ async function captureAuth(args) {
   return authState;
 }
 
+async function runCompatibilitySelfTest(auth, fsClient) {
+  console.log('\nAUTO AI SENSEI SELF-TEST');
+  const nodeMajor = Number(process.versions.node.split('.')[0]);
+  if (!Number.isInteger(nodeMajor) || nodeMajor < 20) {
+    throw new Error(`Node.js 20+ is required; found ${process.versions.node}.`);
+  }
+  console.log(`  Node.js:                 ${process.versions.node} (OK)`);
+
+  if (auth.browser && !auth.browser.isConnected()) {
+    throw new Error('Attached Chrome/Chromium browser is disconnected.');
+  }
+  const page = auth.page;
+  if (!page || page.isClosed()) throw new Error('AI Sensei browser page is not available.');
+  const url = page.url();
+  if (!url.startsWith('https://ai-sensei.com/')) {
+    throw new Error(`Browser is not on AI Sensei after authentication: ${url}`);
+  }
+  console.log(`  Browser connection:      ${auth.externalBrowser ? 'attached CDP browser' : 'Playwright profile'} (OK)`);
+  console.log(`  AI Sensei login:         Firebase user ${auth.uid.slice(0, 6)}…${auth.uid.slice(-4)} (OK)`);
+
+  const [memos, uploads] = await Promise.all([
+    fsClient.sampleMemos(auth.uid, 1),
+    fsClient.sampleUploads(auth.uid, 1),
+  ]);
+  console.log('  Firestore read access:   OK');
+
+  if (memos.length) {
+    const fields = memos[0].fields ?? {};
+    const required = [':game-id', ':move-number', ':solutions'];
+    const missing = required.filter(key => !(key in fields));
+    if (missing.length) throw new Error(`AI Sensei memo schema changed; sample memo is missing ${missing.join(', ')}.`);
+    if (!fields[':solutions']?.mapValue || typeof fields[':solutions'].mapValue.fields !== 'object') {
+      throw new Error('AI Sensei memo schema changed; :solutions is no longer a Firestore map.');
+    }
+    console.log('  Practice memo schema:    OK');
+  } else {
+    console.log('  Practice memo schema:    no saved problems yet (skipped)');
+  }
+
+  if (uploads.length) {
+    const fields = uploads[0].fields ?? {};
+    if (!(':status' in fields) || !(':sgf-info' in fields)) {
+      throw new Error('AI Sensei upload schema changed; sample upload is missing :status or :sgf-info.');
+    }
+    console.log('  Game upload schema:      OK');
+  } else {
+    console.log('  Game upload schema:      no uploaded games yet (skipped)');
+  }
+
+  console.log('\nSELF-TEST PASSED. It is safe to generate a dry-run plan.');
+}
+
 class FirestoreClient {
   constructor(authState) {
     this.authState = authState;
@@ -2453,10 +2517,26 @@ class FirestoreClient {
     });
   }
 
+  async sampleMemos(uid, limit = 1) {
+    return this.runQueryParent(`:users/${uid}`, {
+      from: [{ collectionId: ':memos' }],
+      orderBy: [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }],
+      limit,
+    });
+  }
+
   async allUploads(uid) {
     return this.runQueryParent(`:game-data/${uid}`, {
       from: [{ collectionId: ':uploads' }],
       orderBy: [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }],
+    });
+  }
+
+  async sampleUploads(uid, limit = 1) {
+    return this.runQueryParent(`:game-data/${uid}`, {
+      from: [{ collectionId: ':uploads' }],
+      orderBy: [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }],
+      limit,
     });
   }
 
@@ -6408,6 +6488,10 @@ async function main() {
   try {
     console.log(`Authenticated Firebase user: ${auth.uid.slice(0, 6)}…${auth.uid.slice(-4)}`);
     const fsClient = new FirestoreClient(auth);
+    if (args.selfTest) {
+      await runCompatibilitySelfTest(auth, fsClient);
+      return;
+    }
     if (args.ogsImport) {
       await runOgsImportStage(auth, fsClient, args);
       return;

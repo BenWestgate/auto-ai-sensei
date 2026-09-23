@@ -12,7 +12,21 @@ There are no built-in usernames or account IDs. You provide your own AI Sensei a
 
 ## Quick start for non-technologists
 
-The normal workflow is intentionally two-stage:
+For normal use, there are now three commands to remember:
+
+```bash
+npm run self-test
+npm run upload-games
+npm run update-problems
+```
+
+- `npm run self-test` checks your setup without changing anything.
+- `npm run upload-games` finds all completed games from the OGS account name(s) you enter, shows the upload plan, asks you to type `YES`, and only then uploads/reconciles that exact hash-checked plan.
+- `npm run update-problems` checks all eligible AI Sensei games, shows the proposed practice changes, asks you to type `YES`, and only then applies the exact hash-checked plan.
+
+Both guided commands run the self-test first. They default to the browser on `http://127.0.0.1:9222`, prompt for your OGS/player names if you did not supply them, and stop without changes unless you explicitly confirm.
+
+The underlying safety model is intentionally two-stage even though each guided workflow is one command:
 
 1. **Preview first.** The program reads your AI Sensei account and produces a plan. It does not change anything.
 2. **Apply only after review.** If the plan looks right, copy the exact confirmation command printed by the program.
@@ -63,6 +77,14 @@ If your computer calls the browser `google-chrome` instead of `chromium`, replac
 Sign in to AI Sensei in the browser window that opens and **leave that window open** while Auto AI Sensei is running.
 
 ### 4. Preview your practice-library cleanup
+
+For most users, run:
+
+```bash
+npm run update-problems
+```
+
+It prompts for your player name(s), builds the plan, summarizes it, and asks for confirmation. The lower-level dry-run command below is available when you want to inspect or automate the individual stages yourself.
 
 Replace `YOUR_HANDLE` with your own name as it appears in your games. If you have multiple names, add another `--me YOUR_OTHER_NAME` line.
 
@@ -194,6 +216,24 @@ For a small first pass, add `--max-games 20 --verbose` to the dry run.
 
 ## Import your OGS games
 
+### Guided all-games workflow
+
+For normal use, run:
+
+```bash
+npm run upload-games
+```
+
+Enter one or more OGS usernames when prompted (comma-separated). The command discovers all completed, non-annulled games across those accounts, de-duplicates shared games, performs the compatibility self-test, writes the upload plan, and asks for confirmation. Only after you type `YES` does it rerun the plan and upload games if the hash is unchanged. Existing/checkpointed games and exact local duplicates are skipped rather than reuploaded.
+
+You can also provide account names directly while still using the guided confirmation flow:
+
+```bash
+npm run upload-games -- --ogs-account YOUR_OGS_NAME --ogs-account ANOTHER_OGS_NAME
+```
+
+The lower-level commands below expose the same planner/executor as separate steps.
+
 OGS accounts are also explicit; repeat `--ogs-account` if you have more than one.
 
 First generate and review the import plan:
@@ -235,6 +275,14 @@ GoQuest upload is not implemented.
 ## Customize the curation policy
 
 The rank/Quiz rules are implemented in `src/cleanup/policy.mjs`, while browser reconciliation is in `src/ai-sensei.mjs`. If you fork the project to use different study criteria, change the policy, run `npm test && npm run check`, generate a fresh dry-run plan, and inspect the resulting `CREATE`/`UPDATE`/`DELETE` rows. Never reuse a plan hash from an older policy or analysis state.
+
+An existing saved problem receives special stability treatment: if its move is still among the three largest distinct point-loss mistakes (the same-move-avoidance set), that position is preserved even if current normal-rank thresholds would otherwise choose a different member of the top three. When only its accepted solutions change, the memo is updated in place so training history remains intact.
+
+## Releases and automated testing
+
+Every push to `master` or `main`, and every pull request, runs the test suite and syntax check in GitHub Actions on Node.js 20 and 22.
+
+Version tags such as `v0.2.0` run the same checks and publish a GitHub Release with generated release notes plus a downloadable `auto-ai-sensei-*.tgz` package. Human-readable changes are tracked in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Generated and sensitive files
 

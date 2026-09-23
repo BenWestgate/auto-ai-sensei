@@ -199,18 +199,18 @@ test('remembered top-three position has priority for a loss even when normal ran
   assert.deepEqual(chosen.ranked.map(x => x.moveNumber), [20, 10, 30]);
 });
 
-test('remembered top-three position in a win is replaced only when neither normal-rank metric calls it bad', () => {
+test('remembered top-three position is preserved even when a win now calls it normal-rank good', () => {
   const candidates = [
     { moveNumber: 10, pointLoss: 8, winrateDrop: 0.20, normalBadByPoint: true, normalBadByWinrate: false },
     { moveNumber: 20, pointLoss: 6, winrateDrop: 0.05, normalBadByPoint: false, normalBadByWinrate: false },
     { moveNumber: 30, pointLoss: 5, winrateDrop: 0.10, normalBadByPoint: true, normalBadByWinrate: false },
   ];
-  const replaced = chooseCanonicalFromQuiz(candidates, {
+  const preserved = chooseCanonicalFromQuiz(candidates, {
     resultClass: 'win',
     preferredExistingMoveNumber: 20,
   });
-  assert.equal(replaced.keeper.moveNumber, 10);
-  assert.equal(replaced.preferredExisting, false);
+  assert.equal(preserved.keeper.moveNumber, 20);
+  assert.equal(preserved.preferredExisting, true);
 
   const pointInaccuracy = candidates.map(x => x.moveNumber === 20 ? { ...x, normalBadByPoint: true } : x);
   assert.equal(chooseCanonicalFromQuiz(pointInaccuracy, {

@@ -1,13 +1,26 @@
 {
   "name": "auto-ai-sensei",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Dry-run-first tooling for importing Go games into AI Sensei and curating a personal practice-problem library.",
   "type": "module",
+  "bin": {
+    "auto-ai-sensei": "src/workflow.mjs"
+  },
+  "files": [
+    "src/",
+    "docs/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "scripts": {
     "check": "node --check src/ai-sensei.mjs",
     "help": "node src/ai-sensei.mjs --help",
-    "test": "node --test"
+    "test": "node --test",
+    "self-test": "node src/workflow.mjs self-test",
+    "upload-games": "node src/workflow.mjs upload-games",
+    "update-problems": "node src/workflow.mjs update-problems"
   },
   "engines": {
     "node": ">=20"

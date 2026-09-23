@@ -25,9 +25,16 @@ test('--help is generic and contains no personal account defaults', () => {
   assert.match(source, /--restore-memos-backup PATH/);
   assert.match(source, /--restore-game-removal-backup PATH/);
   assert.match(source, /--restore-player NAME/);
+  assert.match(source, /--self-test/);
   assert.match(source, /const DEFAULT_PLAYER_NAMES = Object\.freeze\(\[\]\);/);
   assert.match(source, /const DEFAULT_OGS_ACCOUNTS = Object\.freeze\(\[\]\);/);
   assert.match(source, /const DEFAULT_GOQUEST_ACCOUNTS = Object\.freeze\(\[\]\);/);
+});
+
+test('--self-test is allowed without a player alias', () => {
+  const result = run('--self-test', '--execute');
+  assert.equal(result.status, 1);
+  assert.match(source, /--self-test is read-only/);
 });
 
 test('cleanup requires an explicit player alias before authentication', () => {

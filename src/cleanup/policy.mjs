@@ -302,7 +302,7 @@ export function chooseCanonicalFromQuiz(top3, {
     : [...top3];
   const ranked = rankByImpact(eligible);
   const preferred = Number.isInteger(preferredExistingMoveNumber)
-    ? eligible.find(x => x.moveNumber === preferredExistingMoveNumber) ?? null
+    ? top3.find(x => x.moveNumber === preferredExistingMoveNumber) ?? null
     : null;
   if (preferred) {
     return {
