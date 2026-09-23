@@ -10,23 +10,106 @@ There are no built-in usernames or account IDs. You provide your own AI Sensei a
 
 > This project automates AI Sensei's current web application and Firestore data model; it is not an official AI Sensei API client. Site/schema changes can break it. Always run and review the dry-run plan before allowing changes.
 
-## Requirements
+## Quick start for non-technologists
+
+The normal workflow is intentionally two-stage:
+
+1. **Preview first.** The program reads your AI Sensei account and produces a plan. It does not change anything.
+2. **Apply only after review.** If the plan looks right, copy the exact confirmation command printed by the program.
+
+If anything looks unexpected, stop after step 1. A dry run is safe to repeat.
+
+### 1. Install the prerequisites
+
+You need:
 
 - Linux or another environment where Playwright/Chromium works
 - Node.js 20+
 - npm
+- Git
+- Chrome or Chromium
 - an AI Sensei account
-- a system Chromium/Chrome executable if you use the recommended CDP login flow
 
-## Install
+If `node --version`, `npm --version`, `git --version`, and either `chromium --version` or `google-chrome --version` all print a version number, you are ready.
+
+### 2. Download Auto AI Sensei
+
+Open a terminal and copy/paste:
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/BenWestgate/auto-ai-sensei.git
 cd auto-ai-sensei
 npm ci
+npm test
 ```
 
-If you want Playwright to launch its own browser, also run `npx playwright install chromium`. For the recommended CDP flow below, install Chromium/Chrome through your operating system so you have a browser executable you can launch directly.
+You should see the tests finish without failures. You normally only need to do this installation once.
+
+### 3. Open AI Sensei in a browser the program can use
+
+First try this command:
+
+```bash
+chromium \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$PWD/.ai-sensei-browser" \
+  --no-first-run \
+  --no-default-browser-check \
+  https://ai-sensei.com
+```
+
+If your computer calls the browser `google-chrome` instead of `chromium`, replace only the first word.
+
+Sign in to AI Sensei in the browser window that opens and **leave that window open** while Auto AI Sensei is running.
+
+### 4. Preview your practice-library cleanup
+
+Replace `YOUR_HANDLE` with your own name as it appears in your games. If you have multiple names, add another `--me YOUR_OTHER_NAME` line.
+
+```bash
+node src/ai-sensei.mjs \
+  --cdp http://127.0.0.1:9222 \
+  --me YOUR_HANDLE
+```
+
+This is a **dry run**. It does not change your account. It creates `cleanup-plan.csv` and `cleanup-plan.json`.
+
+Open `cleanup-plan.csv` in a spreadsheet program. The main action words are:
+
+- `KEEP` — already correct; no change.
+- `UPDATE` — keep the same problem but fix its accepted solutions.
+- `CREATE` — add a selected practice problem.
+- `DELETE` — remove a superseded or unwanted problem.
+- `NONE` — this game correctly needs no problem.
+- `SKIP` — the program could not safely determine what to do, so it leaves the game alone.
+
+### 5. Apply the reviewed plan
+
+At the end of the dry run, Auto AI Sensei prints a **Reviewed-plan command** containing a plan hash. If the CSV looks correct, copy/paste that exact printed command.
+
+Do not reuse an old confirmation command after games, analyses, settings, or code have changed. The safety hash is designed to reject a stale plan.
+
+Before making changes, the program writes a restorable memo backup. It also verifies create/update operations before guarded deletions.
+
+### 6. Updating Auto AI Sensei later
+
+From the `auto-ai-sensei` folder:
+
+```bash
+git pull
+npm ci
+npm test
+```
+
+Then repeat the browser + dry-run steps above.
+
+## Detailed usage
+
+The rest of this README explains the same workflow in more detail, including OGS imports, GoQuest inspection, rank-aware curation, and advanced safety behavior.
+
+## Install details
+
+If you want Playwright to launch its own browser, run `npx playwright install chromium`. For the recommended CDP flow above, install Chromium/Chrome through your operating system so you have a browser executable you can launch directly.
 
 Check the CLI:
 
@@ -37,7 +120,7 @@ npm run help
 
 ## Authenticate to AI Sensei
 
-The safest practical workflow is to launch your own Chromium profile with remote debugging, log in to AI Sensei yourself, and let the script attach to that already-authenticated browser.
+The safest practical workflow is the browser flow from the Quick Start: launch your own Chromium profile with remote debugging, log in to AI Sensei yourself, and let the script attach to that already-authenticated browser.
 
 ```bash
 chromium \
